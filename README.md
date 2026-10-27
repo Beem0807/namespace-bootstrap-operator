@@ -1,0 +1,1 @@
+# namespace-bootstrap-operator
