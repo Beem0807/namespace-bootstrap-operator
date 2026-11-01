@@ -1,0 +1,477 @@
+# Operator pipeline, modelled on reach's agent.yml.
+#
+#   PR into main  -> `checks` (secret + version-bump guard) + `test` (unit, envtest, lint,
+#                    chart-sync, kind e2e) + a `build` that compiles the multi-arch image
+#                    WITHOUT pushing and verifies this version's artifacts don't already
+#                    exist. Nothing is published.
+#   Push to main  -> checks + tests run, and only if they pass does `release` publish, sign,
+#                    attest and tag - but only for what changed:
+#       * code: needs a NEW version (internal/version/version.go) AND a chart bump with
+#         appVersion updated to match (also checked by internal/version/version_test.go).
+#         Publishes the multi-arch image (cosign-signed, SBOM + SLSA provenance) and the
+#         chart; cuts two signed GitHub Releases - v<ver> and helm-<chartVer>.
+#       * chart-only (dist/chart/**): reuses the image; publishes just the chart and its own
+#         release. Tags helm-<chartVer>.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, and AWS_ROLE_ARN
+# (an IAM role assumed via GitHub OIDC - no long-lived AWS keys).
+# Optional repository variable: RELEASES_CF_DISTRIBUTION_ID, so a publish invalidates the
+# chart index at the edge instead of waiting for the TTL.
+#
+# The release host is pre-existing infrastructure this pipeline writes to and does not
+# create: an S3 bucket fronted by a CDN at release.nabeem.com, a GitHub OIDC provider, and
+# a role trusting repo:<owner>/<name>:ref:refs/heads/main with s3:ListBucket/GetObject/PutObject
+# on the bucket plus cloudfront:CreateInvalidation on the distribution. Deliberately no
+# s3:DeleteObject - published artifacts are immutable, so CI cannot remove one by mistake.
+name: Release
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+concurrency:
+  # Cancel superseded PR runs; serialize (never cancel) releases on main.
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # push git tags, create GitHub Releases, publish to gh-pages
+  id-token: write # OIDC for keyless cosign + attestations
+  attestations: write # SLSA build-provenance
+  security-events: write # Trivy SARIF -> code scanning
+
+env:
+  IMAGE: nabeemdev/namespace-bootstrap-operator
+  # The shared release host. Each project publishes under its own prefix with its own
+  # index.yaml, so one project's publish cannot corrupt another's.
+  RELEASES_BUCKET: nabeem-releases
+  CHART_PREFIX: charts/namespace-bootstrap-operator
+  HELM_REPO_URL: https://release.nabeem.com/charts/namespace-bootstrap-operator
+
+jobs:
+  # Version-bump guard. Credential-free (git + file reads only) so it runs on every PR and
+  # a forgotten bump is caught before merge rather than in the release job. Its outputs feed
+  # `build` and `release`, so nothing is recomputed.
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.changed.outputs.code }}
+      chart: ${{ steps.changed.outputs.chart }}
+      version: ${{ steps.ver.outputs.version }}
+      chartver: ${{ steps.ver.outputs.chart }}
+    steps:
+      - name: Validate required secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          missing=""
+          for s in DOCKERHUB_USERNAME DOCKERHUB_TOKEN AWS_ROLE_ARN; do
+            if [ -z "${!s}" ]; then missing="$missing $s"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repository secrets:$missing - add them under Settings > Secrets and variables > Actions before merging to main (the release job needs them)"
+            exit 1
+          fi
+          echo "required secrets present"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect what changed (code vs chart)
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$BASE" ]; then CHANGED=$(git diff --name-only "$BASE" HEAD); else CHANGED=$(git ls-files); fi
+          echo "changed files:"; echo "$CHANGED"
+          code=false; chart=false
+          echo "$CHANGED" | grep -qE '^(api/|cmd/|internal/|Dockerfile$|go\.(mod|sum)$)' && code=true
+          echo "$CHANGED" | grep -qE '^dist/chart/'                                      && chart=true
+          echo "code=$code"   >> "$GITHUB_OUTPUT"
+          echo "chart=$chart" >> "$GITHUB_OUTPUT"
+
+      - name: Read versions
+        id: ver
+        run: |
+          VER=$(grep -oE 'Version = "[0-9]+\.[0-9]+\.[0-9]+"' internal/version/version.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          CHART_VER=$(grep -E '^version:'    dist/chart/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
+          APP_VER=$(grep -E '^appVersion:'   dist/chart/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
+          echo "version=$VER"      >> "$GITHUB_OUTPUT"
+          echo "chart=$CHART_VER"  >> "$GITHUB_OUTPUT"
+          echo "app=$APP_VER"      >> "$GITHUB_OUTPUT"
+          echo "version=$VER  chart=$CHART_VER  appVersion=$APP_VER"
+
+      - name: Version-bump + tag existence check
+        env:
+          CODE: ${{ steps.changed.outputs.code }}
+          CHART_CHANGED: ${{ steps.changed.outputs.chart }}
+          VER: ${{ steps.ver.outputs.version }}
+          CHART_VER: ${{ steps.ver.outputs.chart }}
+          APP_VER: ${{ steps.ver.outputs.app }}
+        run: |
+          tag_exists() { git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1; }
+          fail() { echo "::error::$1"; exit 1; }
+          if [ "$CODE" = "true" ]; then
+            [ "$APP_VER" = "$VER" ] || fail "chart appVersion ($APP_VER) must equal the operator version ($VER) - update appVersion in dist/chart/Chart.yaml"
+            tag_exists "v$VER"            && fail "code changed but tag v$VER already exists - bump Version in internal/version/version.go (and the chart's version + appVersion)"
+            tag_exists "helm-$CHART_VER"  && fail "code changed but tag helm-$CHART_VER already exists - bump 'version:' in dist/chart/Chart.yaml too"
+          elif [ "$CHART_CHANGED" = "true" ]; then
+            tag_exists "helm-$CHART_VER"  && fail "chart changed but tag helm-$CHART_VER already exists - bump 'version:' in dist/chart/Chart.yaml"
+          else
+            echo "no code or chart change detected"
+          fi
+          echo "version-bump check passed"
+
+  # The full local test matrix, exactly what `make test` and `make test-e2e` run.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify generated files are up to date
+        run: |
+          make generate manifests
+          if ! git diff --quiet; then
+            echo "::error::Generated files are stale. Run 'make generate manifests' and commit the result."
+            git diff --stat
+            exit 1
+          fi
+
+      # The guard for the bug that shipped a chart with no RBAC: the chart is
+      # generated from config/, so it can silently fall behind the code.
+      - name: Verify the Helm chart matches the manifests
+        run: |
+          if ! grep -qE '^\s+- (namespaces|resourcequotas|limitranges|networkpolicies)$' dist/chart/templates/rbac/manager-role.yaml; then
+            echo "::error::dist/chart RBAC is missing resources the operator manages. Run 'make helm-regenerate' and commit the result."
+            exit 1
+          fi
+          # The chart's CRD is the generated one wrapped in a Helm conditional, so it
+          # should track the real schema closely. A large divergence means it is stale.
+          CHART_CRD=$(grep -c '' dist/chart/templates/crd/namespaceprofiles.platform.nabeem.com.yaml)
+          REAL_CRD=$(grep -c '' config/crd/bases/platform.nabeem.com_namespaceprofiles.yaml)
+          DELTA=$(( CHART_CRD > REAL_CRD ? CHART_CRD - REAL_CRD : REAL_CRD - CHART_CRD ))
+          if [ "$DELTA" -gt 20 ]; then
+            echo "::error::dist/chart CRD ($CHART_CRD lines) has drifted from config/crd ($REAL_CRD lines). Run 'make helm-regenerate' and commit the result."
+            exit 1
+          fi
+          # The admission-policy templates survive `kubebuilder edit` but values.yaml
+          # does not, so the flag can silently disappear on a chart regeneration.
+          if ! grep -q '^admissionPolicy:' dist/chart/values.yaml; then
+            echo "::error::dist/chart/values.yaml has lost the hand-maintained 'admissionPolicy' block (dropped by 'make helm-regenerate'). Restore it and commit."
+            exit 1
+          fi
+          echo "chart RBAC, CRD and hand-maintained values are in sync with config/"
+
+      - name: Unit + envtest suites
+        run: make test
+
+      - name: Lint
+        run: make lint
+
+      - uses: azure/setup-helm@v4
+      - name: Helm lint
+        run: make helm-lint
+
+      - name: End-to-end tests on Kind
+        run: make test-e2e
+
+  # PR validation: prove the multi-arch image builds and that this version's immutable
+  # artifacts don't already exist - but publish nothing. Credential-free by design, so
+  # existence is checked against the public registry rather than with a login.
+  build:
+    needs: [checks, test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CODE: ${{ needs.checks.outputs.code }}
+      CHART_CHANGED: ${{ needs.checks.outputs.chart }}
+      VER: ${{ needs.checks.outputs.version }}
+      CHART_VER: ${{ needs.checks.outputs.chartver }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        if: env.CODE == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: env.CODE == 'true'
+
+      - name: Ensure this version's artifacts don't already exist
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          if [ "$CODE" = "true" ]; then
+            docker buildx imagetools inspect "$IMAGE:$VER" >/dev/null 2>&1 \
+              && fail "image $IMAGE:$VER already exists in the registry - bump Version in internal/version/version.go"
+          fi
+          if [ "$CODE" = "true" ] || [ "$CHART_CHANGED" = "true" ]; then
+            curl -fsIL -o /dev/null "$HELM_REPO_URL/namespace-bootstrap-operator-$CHART_VER.tgz" \
+              && fail "chart namespace-bootstrap-operator-$CHART_VER.tgz already published - bump 'version:' in dist/chart/Chart.yaml"
+          fi
+          echo "no conflicting artifacts for this version"
+
+      # Multi-arch on the PR too, so an arch-specific build failure is caught before merge.
+      - name: Build image (no push - PR validation)
+        if: env.CODE == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,mode=max,scope=operator
+
+      # Load amd64 into the runner's daemon so Trivy can scan it. The layers are already
+      # cached above, so this is a near-instant cache hit. The OS/library set is
+      # arch-independent for CVE purposes, so scanning one arch is representative.
+      - name: Load image for scanning (amd64)
+        if: env.CODE == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: namespace-bootstrap-operator:pr-scan
+          cache-from: type=gha,scope=operator
+
+      - name: Trivy scan
+        if: env.CODE == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: namespace-bootstrap-operator:pr-scan
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy results
+        if: always() && env.CODE == 'true' && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: operator-image
+
+  # Publish + tag. Merge to main only, after checks and tests pass.
+  release:
+    needs: [checks, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      CODE: ${{ needs.checks.outputs.code }}
+      CHART_CHANGED: ${{ needs.checks.outputs.chart }}
+      VER: ${{ needs.checks.outputs.version }}
+      CHART_VER: ${{ needs.checks.outputs.chartver }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/setup-qemu-action@v3
+        if: env.CODE == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: env.CODE == 'true'
+
+      - name: Docker Hub login
+        if: env.CODE == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # OIDC: a short-lived session for a role scoped to this repo and to this
+      # project's prefix. No access keys exist to leak.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # On top of the tag check in `checks`, refuse to overwrite the actual immutable
+      # artifacts - this guards a prior run that published but died before tagging.
+      # `:latest` is intentionally mutable and is not checked.
+      - name: Ensure this version's artifacts don't already exist
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          if [ "$CODE" = "true" ]; then
+            docker buildx imagetools inspect "$IMAGE:$VER" >/dev/null 2>&1 \
+              && fail "image $IMAGE:$VER already exists - bump Version in internal/version/version.go"
+          fi
+          if [ "$CODE" = "true" ] || [ "$CHART_CHANGED" = "true" ]; then
+            [ -n "$(aws s3 ls "s3://$RELEASES_BUCKET/$CHART_PREFIX/namespace-bootstrap-operator-$CHART_VER.tgz" 2>/dev/null)" ] \
+              && fail "chart $CHART_VER already published - bump 'version:' in dist/chart/Chart.yaml"
+          fi
+          echo "no conflicting artifacts"
+
+      - name: Build metadata
+        if: env.CODE == 'true'
+        id: meta
+        run: |
+          echo "vcs_ref=$(git rev-parse --short HEAD)"     >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Pushed BY DIGEST, untagged: the blob has to be in the registry to scan a multi-arch
+      # image, but it must not be pullable by :version / :latest until it has passed the
+      # scan and been signed. The public tags are applied last, so a vulnerable image stays
+      # a dangling digest nobody pulls by tag.
+      - name: Build + push image (by digest, untagged)
+        if: env.CODE == 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,mode=max,scope=operator
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ env.VER }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+
+      - name: Trivy scan the pushed digest
+        if: env.CODE == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy results
+        if: always() && env.CODE == 'true' && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: operator-image
+
+      - name: Sign image (keyless cosign)
+        if: env.CODE == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Image SBOM (SPDX)
+        if: env.CODE == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/image-sbom.spdx.json
+          upload-artifact: false
+
+      - name: Attach SBOM (cosign attest)
+        if: env.CODE == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate "$RUNNER_TEMP/image-sbom.spdx.json" "$IMAGE@$DIGEST"
+
+      - name: SLSA provenance attestation
+        if: env.CODE == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+      # Applied LAST, only now that the digest has passed the scan and been signed and
+      # attested. Two tags, as requested: the immutable version and the moving :latest.
+      - name: Tag verified image (:version, :latest)
+        if: env.CODE == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VER" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE@$DIGEST"
+          echo "published $IMAGE:$VER and $IMAGE:latest"
+
+      # Package the chart, merge it into this project's existing index, and upload both.
+      # The index is the one mutable object here, which is why it is invalidated below;
+      # the versioned .tgz files are immutable and stay cached at the edge indefinitely.
+      - name: Publish the Helm chart
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
+        run: |
+          helm lint dist/chart --strict
+          WORK=$(mktemp -d)
+          helm package dist/chart -d "$WORK"
+
+          if aws s3 cp "s3://$RELEASES_BUCKET/$CHART_PREFIX/index.yaml" "$WORK/old-index.yaml" >/dev/null 2>&1; then
+            helm repo index "$WORK" --url "$HELM_REPO_URL" --merge "$WORK/old-index.yaml"
+          else
+            helm repo index "$WORK" --url "$HELM_REPO_URL"
+          fi
+          rm -f "$WORK/old-index.yaml"
+
+          aws s3 cp "$WORK/namespace-bootstrap-operator-$CHART_VER.tgz" \
+            "s3://$RELEASES_BUCKET/$CHART_PREFIX/namespace-bootstrap-operator-$CHART_VER.tgz"
+          aws s3 cp "$WORK/index.yaml" "s3://$RELEASES_BUCKET/$CHART_PREFIX/index.yaml"
+
+          # Keep a copy for the chart's GitHub Release asset.
+          cp "$WORK/namespace-bootstrap-operator-$CHART_VER.tgz" .
+
+      # Without this the new chart version is invisible to `helm repo update` until the
+      # index's edge TTL expires. No-op until RELEASES_CF_DISTRIBUTION_ID is set.
+      - name: Invalidate the chart index at the edge
+        if: (env.CODE == 'true' || env.CHART_CHANGED == 'true') && vars.RELEASES_CF_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.RELEASES_CF_DISTRIBUTION_ID }}" \
+            --paths "/$CHART_PREFIX/index.yaml"
+
+      - name: Tag the repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          push_tag() { git tag -a "$1" -m "$2" && git push origin "$1"; echo "tagged $1"; }
+          if [ "$CODE" = "true" ]; then
+            push_tag "v$VER"            "namespace-bootstrap-operator $VER"
+            push_tag "helm-$CHART_VER"  "Helm chart $CHART_VER"
+          elif [ "$CHART_CHANGED" = "true" ]; then
+            push_tag "helm-$CHART_VER"  "Helm chart $CHART_VER"
+          fi
+
+      - name: GitHub Release (operator)
+        if: env.CODE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          gh release create "v$VER" --title "namespace-bootstrap-operator $VER" --notes "$(cat <<EOF
+          Container image \`$IMAGE:$VER\` is cosign-signed (keyless) with an SPDX SBOM and SLSA
+          provenance, and was published only after passing a Trivy scan of this exact digest:
+
+              $IMAGE@$DIGEST
+
+          Install with Helm:
+
+              helm repo add namespace-bootstrap-operator $HELM_REPO_URL
+              helm repo update
+              helm install nbo namespace-bootstrap-operator/namespace-bootstrap-operator \\
+                --namespace nbo-system --create-namespace
+          EOF
+          )"
+
+      - name: GitHub Release (chart)
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "helm-$CHART_VER" \
+            --title "Helm chart $CHART_VER" \
+            --notes "Helm chart \`namespace-bootstrap-operator-$CHART_VER.tgz\`, published to $HELM_REPO_URL (appVersion $VER)." \
+            "namespace-bootstrap-operator-$CHART_VER.tgz"

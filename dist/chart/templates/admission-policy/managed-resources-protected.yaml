@@ -1,0 +1,86 @@
+{{- /*
+Hand-written, not produced by `kubebuilder edit --plugins helm/v2-alpha`. That
+command preserves template files it did not generate, so this survives a chart
+regeneration - but it will not appear in a regenerated values.yaml, which is why
+the guard below reads the value defensively: a values.yaml without the key means
+disabled, never enabled-by-accident.
+
+Opt-in prevention. The operator *corrects* drift on its own; this *rejects* the
+write instead, closing the millisecond window between an edit and its correction
+and - more usefully - telling whoever edited the object where to make the change.
+
+Off by default on purpose. See the README section "Drift is corrected, not
+prevented" for why: the exemption below has to name the operator's ServiceAccount,
+and a wrong name locks the operator out of the very resources it maintains. Here
+that name comes from the same helper the Deployment uses, so the two cannot drift
+apart - which is the whole reason to ship this with the chart rather than leave it
+as a snippet to copy by hand.
+*/}}
+{{- if (.Values.admissionPolicy).enabled }}
+{{- $operatorServiceAccount := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "namespace-bootstrap-operator.serviceAccountName" .) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "managed-resources-protected" "context" $) }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "namespace-bootstrap-operator.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  # Fail closed. The rule is CEL evaluated inside the API server - there is no
+  # webhook to be unavailable - so the only way it errors is a malformed policy,
+  # and silently not enforcing a security control is worse than a rejected write.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      # UPDATE and DELETE only. CREATE is deliberately absent: the operator must
+      # be able to create these objects, and so must anyone setting a namespace up
+      # before a profile adopts it.
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE", "DELETE"]
+        resources: ["resourcequotas", "limitranges"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    # Scoped by label to objects this operator generated. This is the thing RBAC
+    # fundamentally cannot express: a team's own NetworkPolicies, and a quota key
+    # an administrator added, stay freely editable - only the operator's objects
+    # are protected.
+    #
+    # oldObject, not object: on a DELETE there is no new object, and on an UPDATE
+    # the labels being compared should be the ones already on the stored object -
+    # otherwise removing the label in the same request would evade the policy.
+    - name: only-operator-managed
+      expression: >-
+        has(oldObject.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'namespace-bootstrap-operator'
+  validations:
+    - expression: request.userInfo.username == {{ $operatorServiceAccount | quote }}
+      reason: Forbidden
+      messageExpression: >-
+        'this resource is managed by the Namespace Bootstrap Operator; change the ' +
+        'NamespaceProfile that declares it (platform.nabeem.com/profile=' +
+        (oldObject.metadata.labels['platform.nabeem.com/profile']) +
+        ') instead of editing this object directly'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "managed-resources-protected" "context" $) }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "namespace-bootstrap-operator.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  policyName: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "managed-resources-protected" "context" $) }}
+  # A policy without a binding is inert; the binding is what enforces it.
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector: {{ (.Values.admissionPolicy).namespaceSelector | default dict | toYaml | nindent 6 }}
+{{- end }}

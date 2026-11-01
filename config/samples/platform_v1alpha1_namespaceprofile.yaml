@@ -1,0 +1,124 @@
+# A fully specified profile: the shape a platform team would hand to a
+# production tenant. Every section is populated so the generated resources are
+# visible end to end.
+apiVersion: platform.nabeem.com/v1alpha1
+kind: NamespaceProfile
+metadata:
+  name: payments-profile
+  labels:
+    app.kubernetes.io/name: namespace-bootstrap-operator
+spec:
+  namespace: payments
+
+  # The operator will not take over a namespace it did not create unless this
+  # is true. Left false here, so applying this to a cluster that already has a
+  # "payments" namespace reports a conflict instead of seizing it.
+  adoptExisting: false
+
+  # Aggregate ceiling for the namespace, rendered as the ResourceQuota
+  # "nsprofile-quota".
+  quota:
+    requests:
+      cpu: "8"
+      memory: 16Gi
+      # Node disk: container writable layers, emptyDir volumes and logs.
+      ephemeralStorage: 20Gi
+    limits:
+      cpu: "16"
+      memory: 32Gi
+      ephemeralStorage: 40Gi
+    pods: 50
+    storage:
+      requests: 500Gi
+      persistentVolumeClaims: 20
+      classes:
+        - name: fast-ssd
+          requests: 200Gi
+          persistentVolumeClaims: 10
+    # Caps on how many objects of a kind may exist. The operator writes these
+    # numbers into the ResourceQuota; the API server refuses creations beyond
+    # them. Nothing here is ever read, created or deleted by the operator.
+    objectCounts:
+      services: 10
+      secrets: 50
+      configmaps: 50
+      # Zero forbids the kind outright — useful where cloud load balancers are
+      # provisioned centrally rather than by tenants.
+      services.loadbalancers: 0
+      # Anything without a shorthand name uses count/<resource>.<group>.
+      count/deployments.apps: 20
+      count/cronjobs.batch: 5
+      # ServiceAccounts have no shorthand; the core group takes no suffix.
+      count/serviceaccounts: 10
+
+  # Per-container defaults and bounds, rendered as the LimitRange
+  # "nsprofile-limits".
+  #
+  # defaultRequest is not optional in practice here: the quota above constrains
+  # requests.cpu and requests.memory, which makes those requests mandatory for
+  # every pod. Without a default, any pod that omits them is rejected.
+  limitRange:
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    default:
+      cpu: 500m
+      memory: 512Mi
+    min:
+      cpu: 10m
+      memory: 16Mi
+    max:
+      cpu: "4"
+      memory: 8Gi
+      ephemeralStorage: 10Gi
+
+  # Network fence, rendered as one NetworkPolicy per enabled concern.
+  #
+  # Enforcement requires a CNI that implements NetworkPolicy. On a cluster
+  # whose CNI does not, these objects are created and silently ignored.
+  network:
+    defaultDenyIngress: true
+    # Deliberately left at its default of false. Enabling it blocks egress to
+    # the API server, to services in other namespaces and to the internet —
+    # everything except what an explicit policy permits.
+    defaultDenyEgress: false
+    allowDNS: true
+    allowSameNamespace: true
+    # The dns block is omitted, which selects the defaults: CoreDNS/kube-dns in
+    # kube-system, pods labelled "k8s-app: kube-dns", UDP and TCP port 53.
+    # Override it on clusters that deploy DNS differently.
+    #
+    # The three allowances below only take effect alongside a default deny in
+    # their own direction, and they are what makes defaultDenyEgress survivable.
+    # Each is commented out here because this profile does not deny egress.
+    #
+    # allowKubeAPI:
+    #   # The API server is usually not a pod, so it must be named by CIDR.
+    #   # Find the value with: kubectl get endpoints kubernetes -n default
+    #   endpoints: [10.0.0.1/32]
+    #   ports: [{protocol: TCP, port: 443}]
+    #
+    # # Reaching shared platform services without opening egress generally.
+    # allowEgressToNamespaces: [platform-shared, observability]
+    #
+    # # The ingress controller and metrics scraping both need to reach pods
+    # # here, and a default deny on ingress permits neither.
+    # allowIngressFromNamespaces: [ingress-nginx, monitoring]
+
+  # Pod Security Admission, rendered as labels on the namespace. The API
+  # server's built-in admission plugin does the enforcing.
+  security:
+    podSecurityStandard: restricted
+    audit: restricted
+    warn: restricted
+    # "latest" tracks the API server's current definition of the standard, so a
+    # cluster upgrade can tighten admission. Pin to e.g. "v1.34" to freeze it.
+    enforceVersion: latest
+
+  lifecycle:
+    # Deleting this profile will never delete the payments namespace or the
+    # workloads inside it.
+    deleteNamespaceOnRemoval: false
+    # The generated quota, limit range and network policies are removed with
+    # the profile, so nothing is left behind that no profile explains.
+    retainManagedResources: false

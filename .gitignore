@@ -31,3 +31,13 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# --- kubebuilder / operator build output ---
+bin/*
+Dockerfile.cross
+!vendor/**/zz_generated.*
+*.kubeconfig
+.idea
+*.swp
+*.swo
+*~
