@@ -1,5 +1,13 @@
 # namespace-bootstrap-operator
 
+<!-- The Release badge stays grey until the workflow has run on the default branch.
+     Go Report Card is deliberately absent: the service is retired and now returns a
+     "retired" badge for every repository. -->
+[![Release](https://github.com/Beem0807/namespace-bootstrap-operator/actions/workflows/release.yml/badge.svg)](https://github.com/Beem0807/namespace-bootstrap-operator/actions/workflows/release.yml)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.30%2B-326CE5?logo=kubernetes&logoColor=white)](#required-tooling)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 A Kubernetes operator that turns a declarative `NamespaceProfile` into a fully
 governed namespace: resource quota, container limits, a network fence, and a Pod
 Security Admission level — then keeps them that way.
@@ -127,6 +135,163 @@ Two properties this diagram is drawn to make obvious:
 
 ---
 
+## Why not just a Helm chart and ArgoCD?
+
+A fair question, and for many teams the honest answer is **use the chart**. A chart
+templating `Namespace`, `ResourceQuota`, `LimitRange` and `NetworkPolicy`, synced by
+ArgoCD with:
+
+```yaml
+syncPolicy:
+  automated: { selfHeal: true, prune: true }
+```
+
+gives you drift correction, pruning, Git as the source of truth, review, audit and
+rollback — with no controller to operate. If you own the namespaces, are comfortable in
+YAML, and have a handful of them, that is the right tool and this operator is overkill.
+
+### Where templating stops being enough
+
+**A chart can render invalid policy. A CRD can refuse it.**
+
+```yaml
+limitRange:
+  min: {cpu: "2"}
+  max: {cpu: "1"}        # no pod can ever be admitted here
+```
+
+Helm renders that, ArgoCD applies it, and you discover it when every Deployment in the
+namespace starts failing admission. The same values submitted as a NamespaceProfile are
+rejected on write:
+
+```console
+$ kubectl apply -f bad-profile.yaml
+Error: limitRange.min must not exceed limitRange.max
+```
+
+A values file has no admission step. The 36 CEL rules on this CRD have no chart
+equivalent — reserved namespaces, contradictory lifecycle settings, a default-deny
+egress that would take DNS down with it, re-pointing a live profile at another
+namespace.
+
+**Some correctness is conditional logic, not substitution.** A NetworkPolicy restricts
+a direction the moment it names that direction in `policyTypes` — so an *allow*
+same-namespace policy that lists `Egress` while you have not asked to deny egress
+silently cuts the namespace off from DNS, the API server and the internet. That is
+expressible in Go templating, as nested conditionals nobody reviews correctly. Here it
+is a function with a test per combination.
+
+**A chart hits a drift problem this operator had to solve.** The API server *mutates*
+Container-scoped LimitRange items on write: an unset `default` takes `max`'s value, then
+`defaultRequest` takes `default`'s. So the stored object never equals what you
+committed, and ArgoCD reports `OutOfSync` forever until somebody discovers it and adds
+`ignoreDifferences`. The operator replicates that defaulting so desired state equals
+stored state.
+
+**Behaviours are not manifests.** These are decisions made against live cluster state,
+and no template expresses them:
+
+| Situation | Chart + ArgoCD | This operator |
+| --- | --- | --- |
+| Two teams target one namespace | last sync wins, silently | arbitrated deterministically; the loser reports a conflict and touches nothing |
+| The namespace already exists, owned by somebody else | applied over | refused unless `adoptExisting` is set |
+| The Application is deleted with `prune: true` | **deletes the namespace and every workload in it** | namespace retained unless four independent checks pass |
+| Someone adds a quota key by hand | pruned, or fought, depending on config | left alone — it is not a key the operator recorded |
+
+**The interface is a guardrail, not a template.** With a chart the tenant-facing
+contract is a values file plus, in practice, access to raw YAML. With the CRD a team
+gets a validated, documented API and *cannot express an invalid namespace* — while
+write access to a NamespaceProfile stays cluster-admin-adjacent for the reasons in
+[Who may create or update a NamespaceProfile](#who-may-create-or-update-a-namespaceprofile).
+
+### Using it with ArgoCD
+
+These compose, and the combination is better than either alone. Let ArgoCD own the
+*declarations* and the operator own the *enforcement*:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: namespace-profiles
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: https://github.com/your-org/platform-config
+    path: namespace-profiles        # a directory of NamespaceProfile YAMLs
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true                   # safe here - see below
+```
+
+You get Git review and history on the declaration, CEL validation at admission, and a
+controller that owns the messy parts.
+
+What makes this clean is that **ArgoCD never sees the generated objects.** Only the
+profiles are in Git; the quota, limit range and network policies are created by the
+operator and carry no ArgoCD tracking label. So:
+
+- `prune: true` is safe. Deleting a profile from Git deletes the profile, and the
+  operator's finalizer then removes what it generated — it does not delete the
+  namespace. The dangerous pruning case simply does not arise.
+- There is nothing to `ignoreDifferences` for. ArgoCD diffs profiles, which the
+  operator never writes to except in `status` — and status is excluded from diffing by
+  default.
+- An out-of-band edit to a generated resource is the operator's problem, not ArgoCD's,
+  so the two never fight over the same field.
+
+Teach ArgoCD what a healthy profile looks like, and an Application goes green only once
+the namespaces are actually governed:
+
+```yaml
+# argocd-cm ConfigMap
+resource.customizations.health.platform.nabeem.com_NamespaceProfile: |
+  -- Collect first, decide after: conditions are an unordered list, so deciding
+  -- inside the loop would let whichever happens to come first win.
+  hs = {}
+  local ready, degraded
+  if obj.status ~= nil and obj.status.conditions ~= nil then
+    for _, c in ipairs(obj.status.conditions) do
+      if c.type == "Ready"    then ready = c    end
+      if c.type == "Degraded" then degraded = c end
+    end
+  end
+  if degraded ~= nil and degraded.status == "True" then
+    hs.status = "Degraded"; hs.message = degraded.message; return hs
+  end
+  if ready ~= nil and ready.status == "True" then
+    hs.status = "Healthy"; hs.message = ready.message; return hs
+  end
+  if ready ~= nil then
+    -- Not Ready but not Degraded: a namespace conflict or a refused adoption.
+    -- Surfaces the operator's own message in the ArgoCD UI.
+    hs.status = "Progressing"; hs.message = ready.message; return hs
+  end
+  hs.status = "Progressing"
+  hs.message = "Waiting for the profile to be provisioned"
+  return hs
+```
+
+A namespace conflict or a refused adoption then surfaces in the ArgoCD UI with the
+operator's own message, rather than as a green tick over a profile doing nothing.
+
+### When not to use this
+
+- You manage a few namespaces you control yourself — a chart is less machinery.
+- You need policy this API does not express, and would end up with raw manifests
+  alongside it anyway. Two sources of truth is worse than one.
+- Your cluster is below Kubernetes 1.30, where the CRD's `isCIDR()` rule will not
+  compile.
+- Nobody is going to operate the controller. An unmaintained operator is worse than a
+  chart.
+
+---
+
 ## Install
 
 ### With Helm (recommended)
@@ -160,6 +325,11 @@ make deploy IMG=docker.io/nabeemdev/namespace-bootstrap-operator:latest
 
 ### Required tooling
 
+**Kubernetes 1.30 or later.** Two independent things set that floor: the CRD's
+`isCIDR()` validation rule needs the CEL IP/CIDR library, gated at 1.30 in the API
+server (`k8s.io/apiserver/pkg/cel/environment/base.go`), and the optional admission
+policy needs `ValidatingAdmissionPolicy`, which went GA in the same release.
+
 | Tool | Version | Notes |
 |---|---|---|
 | Go | 1.26.3 | controller-runtime v0.25 requires ≥ 1.26.0 |
@@ -174,6 +344,180 @@ is downloaded into `bin/` at pinned versions by the Makefile. Nothing needs to b
 installed globally.
 
 ---
+
+### Seeing it work
+
+Every transcript below is captured from a real Kind cluster running the chart with the
+image pulled from Docker Hub — not illustrative output.
+
+```console
+$ kubectl apply -f config/samples/platform_v1alpha1_namespaceprofile.yaml
+namespaceprofile.platform.nabeem.com/payments-profile created
+
+$ kubectl get nsp
+NAME               NAMESPACE   PHASE   READY   COMPLIANT   AGE
+payments-profile   payments    Ready   True    True        1s
+```
+
+Ready in about a second. The status says what it did and how it assesses each resource:
+
+```console
+$ kubectl get nsp payments-profile -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\n"}{end}'
+Ready            True     Provisioned
+Progressing      False    Provisioned
+Degraded         False    Provisioned
+PolicyCompliant  True     Provisioned
+
+$ kubectl get nsp payments-profile -o jsonpath='{range .status.managedResources[*]}{.kind}/{.name}{"\t"}{.state}{"\n"}{end}'
+Namespace/payments                             InSync
+ResourceQuota/nsprofile-quota                  InSync
+LimitRange/nsprofile-limits                    InSync
+NetworkPolicy/nsprofile-default-deny-ingress   InSync
+NetworkPolicy/nsprofile-allow-same-namespace   InSync
+```
+
+The labels it owns on the namespace — and nothing else, so anything else already there
+survives:
+
+```console
+$ kubectl get ns payments -o jsonpath='{.metadata.labels}' | jq
+app.kubernetes.io/managed-by=namespace-bootstrap-operator
+platform.nabeem.com/profile=payments-profile
+pod-security.kubernetes.io/enforce=restricted
+pod-security.kubernetes.io/enforce-version=latest
+pod-security.kubernetes.io/audit=restricted
+pod-security.kubernetes.io/audit-version=latest
+pod-security.kubernetes.io/warn=restricted
+pod-security.kubernetes.io/warn-version=latest
+```
+
+The whole quota the sample declares, in one object:
+
+```console
+$ kubectl get resourcequota nsprofile-quota -n payments -o jsonpath='{.spec.hard}' | jq
+  requests.cpu:                                                8
+  requests.memory:                                             16Gi
+  requests.ephemeral-storage:                                  20Gi
+  limits.cpu:                                                  16
+  limits.memory:                                               32Gi
+  limits.ephemeral-storage:                                    40Gi
+  pods:                                                        50
+  requests.storage:                                            500Gi
+  persistentvolumeclaims:                                      20
+  fast-ssd.storageclass.storage.k8s.io/requests.storage:       200Gi
+  fast-ssd.storageclass.storage.k8s.io/persistentvolumeclaims: 10
+  services:                                                    10
+  services.loadbalancers:                                      0
+  secrets:                                                     50
+  configmaps:                                                  50
+  count/deployments.apps:                                      20
+  count/cronjobs.batch:                                        5
+  count/serviceaccounts:                                       10
+```
+
+Only the policies the profile actually asks for. The sample denies ingress but not
+egress, so there is no egress-deny and no DNS allowance — and the same-namespace
+allowance names `Ingress` only, because naming a direction is what restricts it:
+
+```console
+$ kubectl get netpol -n payments -o custom-columns=NAME:.metadata.name,TYPES:.spec.policyTypes
+NAME                             TYPES
+nsprofile-default-deny-ingress   [Ingress]
+nsprofile-allow-same-namespace   [Ingress]
+```
+
+With `admissionPolicy.enabled=true`, editing a managed resource is refused rather than
+silently reverted:
+
+```console
+$ kubectl patch resourcequota nsprofile-quota -n payments \
+    --type=merge -p '{"spec":{"hard":{"requests.cpu":"64"}}}'
+Error from server (Forbidden): resourcequotas "nsprofile-quota" is forbidden:
+ValidatingAdmissionPolicy '...-managed-resources-protected' denied request: this
+resource is managed by the Namespace Bootstrap Operator; change the NamespaceProfile
+that declares it (platform.nabeem.com/profile=payments-profile) instead of editing
+this object directly
+
+$ kubectl label ns payments pod-security.kubernetes.io/enforce-
+Error from server (Forbidden): namespaces "payments" is forbidden:
+ValidatingAdmissionPolicy '...-namespace-labels-protected' denied request: the
+ownership and Pod Security labels on this namespace are managed by the Namespace
+Bootstrap Operator ... Every other label on this namespace remains editable.
+
+$ kubectl label ns payments cost-center=platform-eng
+namespace/payments labeled
+```
+
+That last one is the point of a label-scoped policy rather than a blanket one: the
+namespace stays editable, and only the keys the operator owns are frozen.
+
+### Chart configuration
+
+Full defaults are in [`dist/chart/values.yaml`](dist/chart/values.yaml). The values
+worth knowing about:
+
+| Value | Default | Effect |
+| --- | --- | --- |
+| `manager.image.repository` | `docker.io/nabeemdev/namespace-bootstrap-operator` | where to pull from |
+| `manager.image.tag` | *(unset)* | **falls back to `Chart.appVersion`**, so the chart and image versions cannot silently diverge |
+| `manager.image.pullPolicy` | `IfNotPresent` | set `Never` for a locally side-loaded image |
+| `manager.replicas` | `1` | safe to raise: leader election means only one replica reconciles |
+| `manager.resources` | `500m`/`128Mi` limits, `10m`/`64Mi` requests | the operator is cheap; it watches four low-cardinality kinds and no pods |
+| `manager.args` | `[--leader-elect]` | manager flags |
+| `manager.healthProbe.port` | `8081` | `/healthz` and `/readyz` |
+| `manager.affinity`, `nodeSelector`, `tolerations` | empty | standard scheduling controls |
+| `admissionPolicy.enabled` | `false` | opt in to **preventing** edits rather than correcting them — see [Two modes](#two-modes-correct-after-or-prevent-before) |
+| `admissionPolicy.namespaceSelector` | `{}` | pilot prevention on selected namespaces before enabling it everywhere |
+| `rbac.helpers.enabled` | `false` | install the `namespaceprofile-{admin,editor,viewer}` ClusterRoles — see [Who may create or update a NamespaceProfile](#who-may-create-or-update-a-namespaceprofile) |
+| `serviceAccount.enabled` | `true` | set `false` plus `serviceAccount.name` to use an existing one |
+| `crd.enabled` | `true` | set `false` if you manage the CRD separately, e.g. by GitOps |
+| `crd.keep` | `true` | see the warning below |
+| `metrics.enabled` | `true` | serve the metrics endpoint |
+| `metrics.port` | `8443` | |
+| `metrics.secure` | `true` | require authentication and authorization to scrape |
+| `prometheus.enabled` | `false` | install a `ServiceMonitor` (needs the Prometheus Operator) |
+| `networkPolicy.enabled` | `false` | see the warning below |
+
+```bash
+helm install nbo namespace-bootstrap-operator/namespace-bootstrap-operator \
+  --namespace nbo-system --create-namespace \
+  --set admissionPolicy.enabled=true \
+  --set rbac.helpers.enabled=true \
+  --set manager.replicas=2
+```
+
+Preview any change before applying it:
+
+```bash
+helm diff upgrade nbo namespace-bootstrap-operator/namespace-bootstrap-operator \
+  --set admissionPolicy.enabled=true        # needs the helm-diff plugin
+helm template nbo dist/chart --set admissionPolicy.enabled=true   # or just render it
+```
+
+#### Four values that do not mean what their names suggest
+
+> **`rbac.namespaced: true` breaks the operator.** It converts the manager's
+> `ClusterRole` into a namespaced `Role`, and a `Role` cannot grant access to
+> cluster-scoped resources — which `NamespaceProfile` and `Namespace` both are. The
+> operator would start and then fail every reconciliation with `Forbidden`. The value
+> exists because the chart is generated from a kubebuilder scaffold that supports
+> namespace-scoped operators; this one is not. Leave it `false`.
+
+> **`crd.keep: true` means `helm uninstall` leaves the CRD behind.** It stamps
+> `helm.sh/resource-policy: keep` on the CRD, so uninstalling the chart does not delete
+> your `NamespaceProfile` objects — which is almost always what you want, since deleting
+> the CRD would delete every profile, and each profile's finalizer would then run
+> cleanup across every governed namespace. Set it `false` only if you genuinely intend
+> an uninstall to tear all of that down.
+
+> **`networkPolicy.enabled` has nothing to do with the policies the operator
+> generates.** It installs a single NetworkPolicy protecting the *operator's own*
+> metrics port. Tenant network policies come from `spec.network` on a profile and are
+> unaffected by this value.
+
+> **`certManager.enabled` and `webhook.*` do nothing.** This operator serves no
+> webhooks, so there is no certificate to manage. The values are scaffold residue; the
+> webhook flags have been removed from the manager binary.
 
 ## The custom resource
 
