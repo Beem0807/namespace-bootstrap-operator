@@ -230,20 +230,9 @@ jobs:
 
       - name: Trivy scan
         if: env.CODE == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: ./.github/actions/trivy-scan
         with:
-          image-ref: namespace-bootstrap-operator:pr-scan
-          format: sarif
-          output: trivy.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Upload Trivy results
-        if: always() && env.CODE == 'true' && hashFiles('trivy.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy.sarif
+          ref: namespace-bootstrap-operator:pr-scan
           category: operator-image
 
   # Publish + tag. Merge to main only, after checks and tests pass.
@@ -323,20 +312,9 @@ jobs:
 
       - name: Trivy scan the pushed digest
         if: env.CODE == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: ./.github/actions/trivy-scan
         with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          format: sarif
-          output: trivy.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Upload Trivy results
-        if: always() && env.CODE == 'true' && hashFiles('trivy.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy.sarif
+          ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           category: operator-image
 
       - name: Sign image (keyless cosign)

@@ -113,7 +113,12 @@ Both are published artifacts and both are immutable. Re-releasing a version mean
 - **Keyless cosign signatures** — identity is the workflow itself; there is no key to leak.
 - **SPDX SBOM**, attached as an attestation rather than a loose file.
 - **SLSA provenance**, so the build is traceable to this repository and commit.
-- **Trivy** on every PR and on the pushed digest, with results in GitHub code scanning.
+- **Trivy** on every PR and on the pushed digest, with results in GitHub code scanning. Run via
+  [`.github/actions/trivy-scan`](.github/actions/trivy-scan/action.yml), which scans **twice**: once
+  to report (`exit-code: 0`, SARIF uploaded unconditionally) and once to gate (`exit-code: 1`,
+  table output). Reporting and gating are separate calls because a single call that both writes
+  SARIF and fails on a finding can abort before the report is written — losing the alert exactly
+  when there is something to alert about. Unfixable base-image CVEs are reported but do not block.
 - **Actions are pinned by tag, not by digest** — `actions/checkout@v4`,
   `docker/build-push-action@v6` and so on. Tags are mutable, so this trusts the action
   publishers rather than verifying them. Pinning to commit SHAs would close that gap and is the
@@ -197,6 +202,7 @@ Run `make test lint helm-verify` first; it is the same gate CI applies.
 | ----------------------------------------- | ------------------------------------------------------- |
 | `.github/workflows/release.yml`           | the whole pipeline                                      |
 | `hack/verify-chart.sh`                    | chart-drift checks, shared by `make helm-verify` and CI |
+| `.github/actions/trivy-scan/`             | the shared Trivy scan: report + gate                    |
 | `internal/version/version.go`             | the operator version, single source of truth            |
 | `internal/version/version_test.go`        | asserts the chart's `appVersion` matches it             |
 | `dist/chart/Chart.yaml`                   | chart version and `appVersion`                          |

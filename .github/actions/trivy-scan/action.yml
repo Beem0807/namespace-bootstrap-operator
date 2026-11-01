@@ -1,0 +1,49 @@
+name: Trivy scan
+description: >
+  Scan a container image for OS + library vulnerabilities. Uploads SARIF to the GitHub Security
+  tab (code-scanning alerts, with history) and fails on FIXABLE CRITICAL/HIGH findings. Shared by
+  the PR validation build and the release publish so the scan config lives in one place.
+inputs:
+  ref:
+    description: The image ref to scan - a tag in the runner's daemon, or a registry digest.
+    required: true
+  category:
+    description: Code-scanning category, so separate scans' alerts don't overwrite each other.
+    required: true
+runs:
+  using: composite
+  steps:
+    # 1. SARIF for the Security tab. exit-code 0 here so this step only *reports*; the gate below
+    #    is what fails the build. Uploaded unconditionally, so the alerts appear even when the gate
+    #    fails - which is exactly when they matter, and is why reporting and gating are two calls
+    #    rather than one. A single call with format: sarif and exit-code: 1 can abort before the
+    #    report is written, losing the finding it just made.
+    - name: Trivy scan (SARIF report)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: image
+        image-ref: ${{ inputs.ref }}
+        format: sarif
+        output: trivy-results.sarif
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+        vuln-type: os,library
+        exit-code: "0"
+    - name: Upload SARIF to the Security tab
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
+        category: ${{ inputs.category }}
+    # 2. Human-readable gate: reuses the DB just downloaded, so it's fast. Fails on fixable
+    #    CRITICAL/HIGH (unfixable base-image CVEs are reported in the SARIF but don't block).
+    - name: Trivy scan (gate)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: image
+        image-ref: ${{ inputs.ref }}
+        format: table
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+        vuln-type: os,library
+        exit-code: "1"
