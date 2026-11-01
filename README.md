@@ -1258,11 +1258,19 @@ config/                  kustomize: CRDs, RBAC, manager, samples
 dist/chart/              the Helm chart, generated from config/
 test/integration/        manager-driven envtest specs (watches)
 test/e2e/                Kind specs (RBAC, chart, real pods)
+hack/verify-chart.sh     chart-drift checks, shared by `make helm-verify` and CI
+CI.md                    how this repo is tested, built, signed and published
 ```
 
-`make helm-regenerate` rebuilds the chart from `config/`. It is generated, not
-hand-maintained, so it cannot fall behind the RBAC markers — a mistake this repo
-made once and now guards against in CI.
+`make helm-regenerate` rebuilds the chart from `config/`, so its CRD and RBAC cannot
+fall behind the markers — a mistake this repo made once. Two parts of the chart are
+hand-maintained and *do not* survive a regeneration: the admission-policy templates
+and the `admissionPolicy` block in `values.yaml`. `make helm-verify` checks all of
+it — the RBAC rules rule by rule, so a changed verb fails and not merely a missing
+resource — and CI runs the same script.
+
+See [CI.md](CI.md) for the release pipeline, the version-bump rules and the
+one-time setup it expects.
 
 ## Metrics
 

@@ -28,10 +28,10 @@ name: Release
 on:
   pull_request:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
+    paths-ignore: ["**.md"]
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
+    paths-ignore: ["**.md"]
 
 concurrency:
   # Cancel superseded PR runs; serialize (never cancel) releases on main.
@@ -157,27 +157,7 @@ jobs:
       # The guard for the bug that shipped a chart with no RBAC: the chart is
       # generated from config/, so it can silently fall behind the code.
       - name: Verify the Helm chart matches the manifests
-        run: |
-          if ! grep -qE '^\s+- (namespaces|resourcequotas|limitranges|networkpolicies)$' dist/chart/templates/rbac/manager-role.yaml; then
-            echo "::error::dist/chart RBAC is missing resources the operator manages. Run 'make helm-regenerate' and commit the result."
-            exit 1
-          fi
-          # The chart's CRD is the generated one wrapped in a Helm conditional, so it
-          # should track the real schema closely. A large divergence means it is stale.
-          CHART_CRD=$(grep -c '' dist/chart/templates/crd/namespaceprofiles.platform.nabeem.com.yaml)
-          REAL_CRD=$(grep -c '' config/crd/bases/platform.nabeem.com_namespaceprofiles.yaml)
-          DELTA=$(( CHART_CRD > REAL_CRD ? CHART_CRD - REAL_CRD : REAL_CRD - CHART_CRD ))
-          if [ "$DELTA" -gt 20 ]; then
-            echo "::error::dist/chart CRD ($CHART_CRD lines) has drifted from config/crd ($REAL_CRD lines). Run 'make helm-regenerate' and commit the result."
-            exit 1
-          fi
-          # The admission-policy templates survive `kubebuilder edit` but values.yaml
-          # does not, so the flag can silently disappear on a chart regeneration.
-          if ! grep -q '^admissionPolicy:' dist/chart/values.yaml; then
-            echo "::error::dist/chart/values.yaml has lost the hand-maintained 'admissionPolicy' block (dropped by 'make helm-regenerate'). Restore it and commit."
-            exit 1
-          fi
-          echo "chart RBAC, CRD and hand-maintained values are in sync with config/"
+        run: make helm-verify
 
       - name: Unit + envtest suites
         run: make test

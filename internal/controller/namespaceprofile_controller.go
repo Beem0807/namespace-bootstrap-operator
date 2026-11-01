@@ -97,12 +97,17 @@ type NamespaceProfileReconciler struct {
 //     maybeDeleteNamespace, which requires an explicit lifecycle setting, a
 //     confirmation annotation naming the namespace, this profile's ownership
 //     labels, and the namespace not having been adopted.
+//   - the profile itself is never created, updated or deleted by the operator.
+//     It is read, its finalizer is patched, and its status subresource is
+//     patched - so those are the only verbs granted on it. A controller that
+//     could delete the very objects describing its intent would be able to
+//     erase its own instructions.
 //   - nothing here grants access to pods, workloads, secrets, configmaps, or
 //     any RBAC object. Enforcement is left to the Kubernetes mechanisms the
 //     profile configures.
 //
-// +kubebuilder:rbac:groups=platform.nabeem.com,resources=namespaceprofiles,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=platform.nabeem.com,resources=namespaceprofiles/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=platform.nabeem.com,resources=namespaceprofiles,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=platform.nabeem.com,resources=namespaceprofiles/status,verbs=get;patch
 // +kubebuilder:rbac:groups=platform.nabeem.com,resources=namespaceprofiles/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;patch;delete

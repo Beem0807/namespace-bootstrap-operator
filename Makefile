@@ -107,32 +107,7 @@ helm-package: install-helm ## Package the Helm chart into dist/charts/.
 
 .PHONY: helm-verify
 helm-verify: manifests generate ## Check the Helm chart has not drifted from config/.
-	@# Deliberately assertion-based rather than regenerate-and-diff. The chart carries
-	@# hand-maintained content (templates/admission-policy and its values block) that a
-	@# regeneration drops, so a diff against freshly generated output can never pass.
-	@# These are the invariants that actually matter.
-	@grep -qE '^\s+- (namespaces|resourcequotas|limitranges|networkpolicies)$$' \
-		dist/chart/templates/rbac/manager-role.yaml || { \
-		echo "Error: dist/chart RBAC is missing resources the operator manages."; \
-		echo "Run 'make helm-regenerate', restore the hand-maintained values, and commit."; \
-		exit 1; \
-	}
-	@chart_crd=$$(grep -c '' dist/chart/templates/crd/namespaceprofiles.platform.nabeem.com.yaml); \
-	real_crd=$$(grep -c '' config/crd/bases/platform.nabeem.com_namespaceprofiles.yaml); \
-	delta=$$(( chart_crd > real_crd ? chart_crd - real_crd : real_crd - chart_crd )); \
-	if [ "$$delta" -gt 20 ]; then \
-		echo "Error: dist/chart CRD ($$chart_crd lines) has drifted from config/crd ($$real_crd lines)."; \
-		echo "Run 'make helm-regenerate', restore the hand-maintained values, and commit."; \
-		exit 1; \
-	fi
-	@grep -q '^admissionPolicy:' dist/chart/values.yaml || { \
-		echo "Error: dist/chart/values.yaml has lost the hand-maintained 'admissionPolicy' block."; \
-		echo "It is dropped by 'make helm-regenerate'. Restore it (see git history) and commit."; \
-		exit 1; \
-	}
-	@test -f dist/chart/templates/admission-policy/managed-resources-protected.yaml
-	@test -f dist/chart/templates/admission-policy/namespace-labels-protected.yaml
-	@echo "Helm chart is in sync with config/, and its hand-maintained parts are intact."
+	@./hack/verify-chart.sh
 
 .PHONY: helm-regenerate
 helm-regenerate: ## Regenerate the Helm chart from config/ (needs kubebuilder on PATH).
