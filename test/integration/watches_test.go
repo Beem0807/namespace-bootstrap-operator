@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -288,6 +289,79 @@ var _ = Describe("Watches and automatic drift correction", func() {
 				platformv1alpha1.ProfilePhaseReady,
 				platformv1alpha1.ProfilePhaseConflict,
 			))
+		})
+	})
+	Describe("deletion reaches the finalizer through the real watch", func() {
+		// The predicates on the NamespaceProfile watch are GenerationChanged OR
+		// AnnotationChanged. Deleting an object that carries a finalizer is not a
+		// DELETE event — the API server sets deletionTimestamp and sends an
+		// UPDATE — so the obvious worry is that the update is filtered out and
+		// finalize() never runs, leaving the profile stuck in Terminating.
+		//
+		// It is not filtered, because the API server bumps metadata.generation
+		// when it marks an object for deletion (markAsDeleting in
+		// apiserver/pkg/registry/generic/registry/store.go increments generation
+		// when deletionTimestamp was nil). GenerationChangedPredicate therefore
+		// passes the event through.
+		//
+		// That is a guarantee of the API server, not of this repository, so it is
+		// asserted here rather than assumed: this spec runs against a real manager
+		// with the real predicates, which the controller unit specs do not — they
+		// call Reconcile directly and so cannot catch a predicate regression.
+		It("runs cleanup and releases the object when a profile is deleted", func() {
+			ns := unique("finalizer-through-watch")
+			profile := createProfile("finalizer-through-watch-profile", ns)
+			key := client.ObjectKeyFromObject(profile)
+
+			By("waiting for the operator to register its finalizer")
+			Eventually(func() ([]string, error) {
+				var live platformv1alpha1.NamespaceProfile
+				if err := k8sClient.Get(ctx, key, &live); err != nil {
+					return nil, err
+				}
+				return live.Finalizers, nil
+			}).Should(ContainElement(platformv1alpha1.CleanupFinalizer))
+
+			By("confirming the generated resources exist")
+			Eventually(func() error {
+				var quota corev1.ResourceQuota
+				return k8sClient.Get(ctx, client.ObjectKey{
+					Namespace: ns, Name: platformv1alpha1.ResourceQuotaName,
+				}, &quota)
+			}).Should(Succeed())
+
+			var before platformv1alpha1.NamespaceProfile
+			Expect(k8sClient.Get(ctx, key, &before)).To(Succeed())
+
+			By("deleting the profile")
+			Expect(k8sClient.Delete(ctx, profile)).To(Succeed())
+
+			// The real assertion: the object actually goes away. It cannot,
+			// while the finalizer is held, unless the controller was woken by the
+			// deletion update and ran finalize() to completion.
+			By("the object disappearing, which only happens if finalize() ran")
+			Eventually(func() bool {
+				var live platformv1alpha1.NamespaceProfile
+				err := k8sClient.Get(ctx, key, &live)
+				return apierrors.IsNotFound(err)
+			}).Should(BeTrue(), "profile stayed Terminating: the deletion update was filtered "+
+				"out by the watch predicates and finalize() never ran")
+
+			By("cleanup having removed the generated ResourceQuota")
+			Eventually(func() bool {
+				var quota corev1.ResourceQuota
+				err := k8sClient.Get(ctx, client.ObjectKey{
+					Namespace: ns, Name: platformv1alpha1.ResourceQuotaName,
+				}, &quota)
+				return apierrors.IsNotFound(err)
+			}).Should(BeTrue())
+
+			// Documents *why* the predicate lets the deletion through, so a
+			// future reader does not "simplify" the predicate and silently break
+			// cleanup. envtest runs a real API server, so this is the real rule.
+			By("recording that marking for deletion bumps metadata.generation")
+			Expect(before.DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(before.Generation).To(BeNumerically(">", 0))
 		})
 	})
 })

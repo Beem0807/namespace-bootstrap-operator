@@ -102,7 +102,14 @@ jobs:
           if [ -n "$BASE" ]; then CHANGED=$(git diff --name-only "$BASE" HEAD); else CHANGED=$(git ls-files); fi
           echo "changed files:"; echo "$CHANGED"
           code=false; chart=false
-          echo "$CHANGED" | grep -qE '^(api/|cmd/|internal/|Dockerfile$|go\.(mod|sum)$)' && code=true
+          # _test.go files are compiled only by `go test` and never reach the image, so a
+          # test-only change cannot alter what is published: it must not demand a version
+          # bump or cut a release. They are still *run* - the `test` job is ungated - so a
+          # broken test fails the PR either way. Everything under test/ is already outside
+          # these paths; this also excludes the _test.go files that sit next to the code.
+          echo "$CHANGED" \
+            | grep -E '^(api/|cmd/|internal/|Dockerfile$|go\.(mod|sum)$)' \
+            | grep -qvE '_test\.go$' && code=true
           echo "$CHANGED" | grep -qE '^dist/chart/'                                      && chart=true
           echo "code=$code"   >> "$GITHUB_OUTPUT"
           echo "chart=$chart" >> "$GITHUB_OUTPUT"
@@ -197,6 +204,9 @@ jobs:
         if: env.CODE == 'true'
 
       - name: Ensure this version's artifacts don't already exist
+        # Skipped outright when nothing publishable changed, rather than running and
+        # printing a clean bill of health it never actually established.
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
         run: |
           fail() { echo "::error::$1"; exit 1; }
           if [ "$CODE" = "true" ]; then
@@ -268,7 +278,13 @@ jobs:
 
       # OIDC: a short-lived session for a role scoped to this repo and to this
       # project's prefix. No access keys exist to leak.
+      #
+      # Only the chart publish and the CDN invalidation touch AWS, so this is gated
+      # the same way they are. Without the gate, a merge that publishes nothing -
+      # docs, tests, CI - still assumes the role, and an unrelated IAM or OIDC
+      # problem fails the release job for a commit that needed no AWS at all.
       - uses: aws-actions/configure-aws-credentials@v4
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
@@ -277,6 +293,9 @@ jobs:
       # artifacts - this guards a prior run that published but died before tagging.
       # `:latest` is intentionally mutable and is not checked.
       - name: Ensure this version's artifacts don't already exist
+        # Skipped outright when nothing publishable changed, rather than running and
+        # printing a clean bill of health it never actually established.
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
         run: |
           fail() { echo "::error::$1"; exit 1; }
           if [ "$CODE" = "true" ]; then
@@ -397,6 +416,7 @@ jobs:
             --paths "/$CHART_PREFIX/index.yaml"
 
       - name: Tag the repo
+        if: env.CODE == 'true' || env.CHART_CHANGED == 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
