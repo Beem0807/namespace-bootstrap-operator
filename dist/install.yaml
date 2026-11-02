@@ -1,0 +1,1548 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+    control-plane: controller-manager
+  name: namespace-bootstrap-operator-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: namespaceprofiles.platform.nabeem.com
+spec:
+  group: platform.nabeem.com
+  names:
+    kind: NamespaceProfile
+    listKind: NamespaceProfileList
+    plural: namespaceprofiles
+    shortNames:
+    - nsprofile
+    - nsp
+    singular: namespaceprofile
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.namespace
+      name: Namespace
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="PolicyCompliant")].status
+      name: Compliant
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          NamespaceProfile is the declared configuration of one Kubernetes namespace:
+          its resource quota, container limits, network fence and Pod Security
+          Admission level.
+
+          It is cluster-scoped. Creating a namespace and choosing its Pod Security
+          level are cluster-level powers, so the resource that confers them should not
+          be grantable inside a single namespace. Cluster scope also makes
+          metadata.name unique across the cluster, which is what lets the operator
+          record namespace ownership in a single label.
+
+          The operator manages only namespace-level policy. It never creates, inspects
+          or modifies workloads; enforcement is left to the Kubernetes mechanisms the
+          profile configures.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of NamespaceProfile
+            properties:
+              adoptExisting:
+                default: false
+                description: |-
+                  adoptExisting controls what happens when the target namespace, or a
+                  managed resource at one of this operator's deterministic names, already
+                  exists without this operator's ownership labels.
+
+                  When false (the default) the operator refuses to touch pre-existing
+                  objects and reports the situation through status conditions, so it can
+                  never silently seize a namespace that another system created.
+
+                  When true the operator stamps its ownership labels onto those objects
+                  and begins managing them. An adopted namespace is additionally marked
+                  with the "platform.nabeem.com/adopted" annotation, which permanently
+                  disqualifies it from operator-driven deletion: the operator did not
+                  create it, so it will not destroy it.
+                type: boolean
+              lifecycle:
+                description: |-
+                  lifecycle declares what the operator does when this profile is deleted.
+
+                  Omit for the safe defaults: retain the namespace, remove the generated
+                  quota, limit range and network policies.
+                properties:
+                  deleteNamespaceOnRemoval:
+                    default: false
+                    description: |-
+                      deleteNamespaceOnRemoval allows the operator to delete the target
+                      namespace when this profile is deleted.
+
+                      Deleting a namespace cascades to every object in it — Deployments,
+                      StatefulSets, PersistentVolumeClaims and their data, Secrets — none of
+                      which this operator manages or can restore. It therefore defaults to
+                      false, and setting it to true is not by itself sufficient: the operator
+                      additionally requires the confirmation annotation
+                      "platform.nabeem.com/confirm-namespace-deletion", whose value must equal
+                      spec.namespace, and it refuses outright for namespaces it adopted rather
+                      than created. When any check fails the operator retains the namespace
+                      and explains why in status rather than guessing.
+                    type: boolean
+                  retainManagedResources:
+                    default: false
+                    description: |-
+                      retainManagedResources leaves the generated ResourceQuota, LimitRange
+                      and NetworkPolicies in the namespace after this profile is deleted.
+
+                      The default is false — cleanup removes them. An orphaned default-deny
+                      NetworkPolicy that no profile explains is a trap: it keeps breaking
+                      traffic with nothing left in the cluster to say why. Removing the
+                      generated objects is reversible, never touches workloads, and leaves the
+                      namespace in a plainly unmanaged state.
+
+                      Set this to true when deliberately handing a namespace over to another
+                      system — GitOps, say — that should keep the current policy objects in
+                      place. The trade-off is that the namespace is then left with policy
+                      nobody owns, including the loss of its quota ceiling being invisible.
+                    type: boolean
+                type: object
+                x-kubernetes-validations:
+                - message: lifecycle.retainManagedResources is meaningless with deleteNamespaceOnRemoval=true,
+                    because deleting the namespace deletes the managed resources with
+                    it
+                  rule: '!(self.deleteNamespaceOnRemoval && self.retainManagedResources)'
+              limitRange:
+                description: |-
+                  limitRange declares per-container resource defaults and bounds, rendered
+                  into a single LimitRange with one Container-scoped item.
+
+                  Omit to manage no LimitRange.
+                minProperties: 1
+                properties:
+                  default:
+                    description: |-
+                      default is the resource limit applied to a container that declares none.
+                      Renders the LimitRange "default" for type Container.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                  defaultRequest:
+                    description: |-
+                      defaultRequest is the resource request applied to a container that
+                      declares none. Renders the LimitRange "defaultRequest" for type
+                      Container.
+
+                      Set this whenever quota.requests is set, otherwise pods without explicit
+                      requests are rejected by the ResourceQuota.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                  max:
+                    description: |-
+                      max is the largest limit a container may declare. Renders the LimitRange
+                      "max" for type Container. Containers above it are rejected.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                  min:
+                    description: |-
+                      min is the smallest request a container may declare. Renders the
+                      LimitRange "min" for type Container. Containers below it are rejected.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                type: object
+                x-kubernetes-validations:
+                - message: limitRange.min must not exceed limitRange.max
+                  rule: '!has(self.min) || !has(self.max) || ((!has(self.min.cpu)
+                    || !has(self.max.cpu) || quantity(string(self.min.cpu)).compareTo(quantity(string(self.max.cpu)))
+                    <= 0) && (!has(self.min.memory) || !has(self.max.memory) || quantity(string(self.min.memory)).compareTo(quantity(string(self.max.memory)))
+                    <= 0) && (!has(self.min.ephemeralStorage) || !has(self.max.ephemeralStorage)
+                    || quantity(string(self.min.ephemeralStorage)).compareTo(quantity(string(self.max.ephemeralStorage)))
+                    <= 0))'
+                - message: limitRange.min must not exceed limitRange.defaultRequest
+                  rule: '!has(self.min) || !has(self.defaultRequest) || ((!has(self.min.cpu)
+                    || !has(self.defaultRequest.cpu) || quantity(string(self.min.cpu)).compareTo(quantity(string(self.defaultRequest.cpu)))
+                    <= 0) && (!has(self.min.memory) || !has(self.defaultRequest.memory)
+                    || quantity(string(self.min.memory)).compareTo(quantity(string(self.defaultRequest.memory)))
+                    <= 0) && (!has(self.min.ephemeralStorage) || !has(self.defaultRequest.ephemeralStorage)
+                    || quantity(string(self.min.ephemeralStorage)).compareTo(quantity(string(self.defaultRequest.ephemeralStorage)))
+                    <= 0))'
+                - message: limitRange.min must not exceed limitRange.default
+                  rule: '!has(self.min) || !has(self.default) || ((!has(self.min.cpu)
+                    || !has(self.default.cpu) || quantity(string(self.min.cpu)).compareTo(quantity(string(self.default.cpu)))
+                    <= 0) && (!has(self.min.memory) || !has(self.default.memory) ||
+                    quantity(string(self.min.memory)).compareTo(quantity(string(self.default.memory)))
+                    <= 0) && (!has(self.min.ephemeralStorage) || !has(self.default.ephemeralStorage)
+                    || quantity(string(self.min.ephemeralStorage)).compareTo(quantity(string(self.default.ephemeralStorage)))
+                    <= 0))'
+                - message: limitRange.defaultRequest must not exceed limitRange.default
+                  rule: '!has(self.defaultRequest) || !has(self.default) || ((!has(self.defaultRequest.cpu)
+                    || !has(self.default.cpu) || quantity(string(self.defaultRequest.cpu)).compareTo(quantity(string(self.default.cpu)))
+                    <= 0) && (!has(self.defaultRequest.memory) || !has(self.default.memory)
+                    || quantity(string(self.defaultRequest.memory)).compareTo(quantity(string(self.default.memory)))
+                    <= 0) && (!has(self.defaultRequest.ephemeralStorage) || !has(self.default.ephemeralStorage)
+                    || quantity(string(self.defaultRequest.ephemeralStorage)).compareTo(quantity(string(self.default.ephemeralStorage)))
+                    <= 0))'
+                - message: limitRange.defaultRequest must not exceed limitRange.max
+                  rule: '!has(self.defaultRequest) || !has(self.max) || ((!has(self.defaultRequest.cpu)
+                    || !has(self.max.cpu) || quantity(string(self.defaultRequest.cpu)).compareTo(quantity(string(self.max.cpu)))
+                    <= 0) && (!has(self.defaultRequest.memory) || !has(self.max.memory)
+                    || quantity(string(self.defaultRequest.memory)).compareTo(quantity(string(self.max.memory)))
+                    <= 0) && (!has(self.defaultRequest.ephemeralStorage) || !has(self.max.ephemeralStorage)
+                    || quantity(string(self.defaultRequest.ephemeralStorage)).compareTo(quantity(string(self.max.ephemeralStorage)))
+                    <= 0))'
+                - message: limitRange.default must not exceed limitRange.max
+                  rule: '!has(self.default) || !has(self.max) || ((!has(self.default.cpu)
+                    || !has(self.max.cpu) || quantity(string(self.default.cpu)).compareTo(quantity(string(self.max.cpu)))
+                    <= 0) && (!has(self.default.memory) || !has(self.max.memory) ||
+                    quantity(string(self.default.memory)).compareTo(quantity(string(self.max.memory)))
+                    <= 0) && (!has(self.default.ephemeralStorage) || !has(self.max.ephemeralStorage)
+                    || quantity(string(self.default.ephemeralStorage)).compareTo(quantity(string(self.max.ephemeralStorage)))
+                    <= 0))'
+              namespace:
+                description: |-
+                  namespace is the name of the namespace this profile governs.
+
+                  It is immutable: re-pointing a live profile at a different namespace
+                  would silently abandon the first namespace's quota, limits and network
+                  policies with no record that they were ever managed. Delete and recreate
+                  the profile instead.
+
+                  Namespaces beginning with "kube-" and the "default" namespace are
+                  rejected. Applying a default-deny network policy or a restricted Pod
+                  Security level to kube-system can disable cluster-critical components,
+                  and this operator offers no way to make that reversible.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: spec.namespace is immutable; delete and recreate the NamespaceProfile
+                    to target a different namespace
+                  rule: self == oldSelf
+                - message: spec.namespace must not target a reserved namespace (kube-*
+                    or default)
+                  rule: '!self.startsWith(''kube-'') && self != ''default'''
+              network:
+                description: |-
+                  network declares how the namespace is fenced, rendered into a set of
+                  NetworkPolicies.
+
+                  Omit to manage no NetworkPolicies. Enforcement is the responsibility of
+                  the cluster's CNI plugin: creating these objects on a cluster whose CNI
+                  does not implement NetworkPolicy has no effect on traffic whatsoever.
+                properties:
+                  allowDNS:
+                    default: true
+                    description: |-
+                      allowDNS permits egress to the cluster DNS service. Only meaningful when
+                      defaultDenyEgress is true, since without a default deny egress is
+                      already unrestricted.
+
+                      The DNS service's location and labels are cluster-specific; see the dns
+                      field.
+                    type: boolean
+                  allowEgressToNamespaces:
+                    description: |-
+                      allowEgressToNamespaces permits egress to every pod in the named
+                      namespaces. Only meaningful when defaultDenyEgress is true.
+
+                      This is how a namespace reaches shared platform services — a database,
+                      an internal registry, an observability stack — without opening egress
+                      generally.
+                    items:
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: set
+                  allowIngressFromNamespaces:
+                    description: |-
+                      allowIngressFromNamespaces permits ingress from every pod in the named
+                      namespaces. Only meaningful when defaultDenyIngress is true.
+
+                      Typically the ingress controller's namespace, and whichever namespace
+                      runs metrics scraping — both of which need to reach pods here and
+                      neither of which a default-deny ingress permits.
+                    items:
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: set
+                  allowKubeAPI:
+                    description: |-
+                      allowKubeAPI permits egress to the Kubernetes API server. Only
+                      meaningful when defaultDenyEgress is true.
+
+                      Almost every namespace needs this: controllers, operators and
+                      service-mesh sidecars all talk to the API server, and a default-deny
+                      egress silently breaks them.
+
+                      The endpoints must be given explicitly rather than inferred, because the
+                      API server is usually not a pod. On managed clusters it is outside the
+                      cluster entirely; with kubeadm it is a host process. A NetworkPolicy peer
+                      can only select pods, namespaces or CIDRs, so reaching it requires an
+                      ipBlock — and the correct CIDR is specific to the cluster. Guessing would
+                      produce a policy that permits nothing while appearing to permit
+                      something, which is the worst available outcome.
+
+                      Find the value with: kubectl get endpoints kubernetes -n default
+                    properties:
+                      endpoints:
+                        description: |-
+                          endpoints are the CIDRs the API server is reachable on.
+
+                          A single address is written as a /32 (or /128 for IPv6). More than one
+                          entry is normal for a highly available control plane.
+                        items:
+                          maxLength: 43
+                          type: string
+                        maxItems: 16
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: set
+                        x-kubernetes-validations:
+                        - message: endpoints must be CIDRs, for example 10.0.0.1/32
+                          rule: self.all(e, isCIDR(e))
+                      ports:
+                        default:
+                        - port: 443
+                          protocol: TCP
+                        description: ports are the API server ports to permit. Defaults
+                          to TCP port 443.
+                        items:
+                          description: |-
+                            NetworkPort is a protocol and port pair to permit.
+
+                            Each field that takes a list of these carries its own default — DNS defaults
+                            to UDP and TCP port 53, the Kubernetes API to TCP port 443 — so the defaults
+                            live where they make sense rather than on the shared type.
+                          properties:
+                            port:
+                              description: port is the port number.
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                            protocol:
+                              default: TCP
+                              description: protocol is the IP protocol.
+                              enum:
+                              - TCP
+                              - UDP
+                              - SCTP
+                              type: string
+                          required:
+                          - port
+                          type: object
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - endpoints
+                    type: object
+                  allowSameNamespace:
+                    default: true
+                    description: |-
+                      allowSameNamespace permits pods in this namespace to talk to each other.
+
+                      It adds an ingress allowance from pods in the same namespace, and when
+                      defaultDenyEgress is true a matching egress allowance, so intra-namespace
+                      traffic works in both directions.
+                    type: boolean
+                  defaultDenyEgress:
+                    default: false
+                    description: |-
+                      defaultDenyEgress denies all outbound pod traffic by default.
+
+                      This is the most disruptive field in the API and defaults to false. With
+                      it enabled, pods cannot reach DNS, the Kubernetes API server, cluster
+                      services in other namespaces, or anything on the internet unless a
+                      policy permits it. allowDNS covers DNS; everything else is out of this
+                      profile's scope and must be granted by policies you manage yourself.
+
+                      Image pulls are unaffected, because the kubelet — not the pod — fetches
+                      images.
+                    type: boolean
+                  defaultDenyIngress:
+                    default: true
+                    description: |-
+                      defaultDenyIngress denies all inbound pod traffic by default, so only
+                      traffic explicitly permitted by another policy is allowed.
+
+                      This is safe to enable on an existing namespace only if you also permit
+                      the traffic its workloads actually receive — most obviously via
+                      allowSameNamespace, and via ingress-controller policies that live
+                      outside this profile.
+                    type: boolean
+                  dns:
+                    default: {}
+                    description: |-
+                      dns overrides how the cluster DNS service is identified when allowDNS is
+                      in effect.
+
+                      Defaults suit kube-dns and CoreDNS as deployed by kubeadm, kind and most
+                      managed providers: the "kube-system" namespace, pods labelled
+                      "k8s-app: kube-dns", UDP and TCP port 53. Clusters that deploy DNS
+                      elsewhere, label it differently, or run it on a non-standard port must
+                      set this, or the generated allowance will not match the real DNS pods
+                      and resolution will fail.
+
+                      Defaulted to an empty object so the API server fills in the fields below
+                      and stores them explicitly. The DNS assumptions are therefore visible in
+                      the stored resource and defined in exactly one place — the schema —
+                      rather than being duplicated as fallbacks in controller code.
+                    properties:
+                      namespace:
+                        default: kube-system
+                        description: namespace is the namespace running the cluster
+                          DNS pods.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      podSelector:
+                        default:
+                          matchLabels:
+                            k8s-app: kube-dns
+                        description: |-
+                          podSelector selects the DNS pods within that namespace. CoreDNS and
+                          kube-dns both carry "k8s-app: kube-dns" in standard deployments, which
+                          is the default.
+                        properties:
+                          matchExpressions:
+                            description: matchExpressions is a list of label selector
+                              requirements. The requirements are ANDed.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                              map is equivalent to an element of matchExpressions, whose key field is "key", the
+                              operator is "In", and the values array contains only "value". The requirements are ANDed.
+                            type: object
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      ports:
+                        default:
+                        - port: 53
+                          protocol: UDP
+                        - port: 53
+                          protocol: TCP
+                        description: |-
+                          ports are the DNS ports to permit. Both UDP and TCP port 53 are
+                          permitted by default: resolvers fall back to TCP for responses too large
+                          for UDP, so permitting only UDP breaks large responses intermittently
+                          and confusingly.
+                        items:
+                          description: |-
+                            NetworkPort is a protocol and port pair to permit.
+
+                            Each field that takes a list of these carries its own default — DNS defaults
+                            to UDP and TCP port 53, the Kubernetes API to TCP port 443 — so the defaults
+                            live where they make sense rather than on the shared type.
+                          properties:
+                            port:
+                              description: port is the port number.
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                            protocol:
+                              default: TCP
+                              description: protocol is the IP protocol.
+                              enum:
+                              - TCP
+                              - UDP
+                              - SCTP
+                              type: string
+                          required:
+                          - port
+                          type: object
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: network.defaultDenyEgress with allowDNS=false blocks all
+                    DNS resolution in the namespace; set allowDNS=true
+                  rule: '!(self.defaultDenyEgress && !self.allowDNS)'
+              quota:
+                description: |-
+                  quota declares the namespace's aggregate share of the cluster and is
+                  rendered into a single ResourceQuota.
+
+                  Omit to manage no ResourceQuota. Note that a ResourceQuota constraining
+                  requests.cpu or requests.memory makes those requests *mandatory* for
+                  every pod in the namespace; pair it with limitRange.defaultRequest so
+                  that pods which do not set requests explicitly remain admissible.
+                minProperties: 1
+                properties:
+                  extendedResources:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: "extendedResources caps aggregate consumption of
+                      resources that are not\nbuilt into Kubernetes: device-plugin
+                      resources such as GPUs, and\nhugepages. Each entry renders the
+                      ResourceQuota hard limit\n\"requests.<key>\".\n\n\textendedResources:\n\t
+                      \ nvidia.com/gpu: \"4\"\n\t  amd.com/gpu: \"2\"\n\t  hugepages-2Mi:
+                      512Mi\n\nKeys must be either a vendor-qualified name (\"nvidia.com/gpu\")
+                      or a\nhugepages size (\"hugepages-2Mi\"). Do not include a \"requests.\"
+                      prefix;\nthe operator adds it.\n\nOnly the requests side is
+                      expressible, and that is sufficient:\nKubernetes requires extended
+                      resources to be requested and limited at\nthe same value, so
+                      a request ceiling is also a limit ceiling. cpu,\nmemory and
+                      ephemeral storage are rejected here — they have typed fields\nunder
+                      requests and limits, so each limit has one canonical place.\n\nA
+                      value of zero is meaningful and allowed: it forbids the resource
+                      in\nthis namespace outright, which is how a platform keeps accelerators
+                      out\nof namespaces that have no business requesting them.\n\nAs
+                      with objectCounts, keys are free-form because the set of device\nplugins
+                      a cluster might install is open-ended. The cap of eight entries\nis
+                      partly a cost control: the API server budgets the CEL rules
+                      below\nagainst the map's declared maximum size, and map keys
+                      have no length\nbound it can assume."
+                    maxProperties: 8
+                    type: object
+                    x-kubernetes-validations:
+                    - message: extendedResources keys must be a vendor-qualified resource
+                        name such as nvidia.com/gpu, or a hugepages size such as hugepages-2Mi
+                      rule: self.all(k, k.matches('^([a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)+/[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?|hugepages-[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei))$'))
+                    - message: extendedResources keys must not carry a requests. or
+                        limits. prefix; the operator adds it
+                      rule: '!self.exists(k, k.startsWith(''requests.'') || k.startsWith(''limits.''))'
+                    - message: the kubernetes.io/ prefix is reserved and cannot be
+                        used for an extended resource
+                      rule: '!self.exists(k, k.startsWith(''kubernetes.io/''))'
+                    - message: extendedResources values must not be negative
+                      rule: '!self.exists(k, quantity(string(self[k])).isLessThan(quantity(''0'')))'
+                  limits:
+                    description: |-
+                      limits caps the sum of container resource *limits* across the namespace.
+                      Renders the ResourceQuota hard limits "limits.cpu" and "limits.memory".
+
+                      This bounds the namespace's burst ceiling rather than its reservation,
+                      and is normally set higher than requests to permit overcommit.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                  objectCounts:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: "objectCounts caps how many objects of a given kind
+                      may exist in the\nnamespace. Each entry renders one ResourceQuota
+                      hard limit under the key\nit is named for.\n\nTwo key forms
+                      are accepted. Kubernetes defines nine shorthand names —\n\"services\",
+                      \"services.nodeports\", \"services.loadbalancers\", \"secrets\",\n\"configmaps\",
+                      \"replicationcontrollers\" and \"resourcequotas\" — and the\ngeneric
+                      form \"count/<resource>.<group>\" works for anything else,\nincluding
+                      custom resources:\n\n\tobjectCounts:\n\t  services: 10\n\t  secrets:
+                      50\n\t  count/deployments.apps: 20\n\t  count/cronjobs.batch:
+                      5\n\t  count/serviceaccounts: 10\n\nNote that ServiceAccounts
+                      have no shorthand, so they are capped as\n\"count/serviceaccounts\"
+                      — the core API group takes no suffix.\n\nThis caps object *counts*
+                      only. It is not workload management: the\noperator never reads,
+                      creates or deletes any of the objects named here.\nIt writes
+                      one number into the ResourceQuota and the API server refuses\ncreations
+                      beyond it, which is the same division of labour as every other\nfield
+                      in this profile.\n\nA key is deliberately a free-form string
+                      rather than an enumeration,\nbecause every CustomResourceDefinition
+                      installed in a cluster adds\nanother possible key. Enumerating
+                      them would mean a release of this\noperator every time a team
+                      wanted to cap a new kind.\n\n\"pods\" and \"persistentvolumeclaims\"
+                      are rejected here; use spec.quota.pods\nand spec.quota.storage.persistentVolumeClaims,
+                      so that each limit has\nexactly one place it can be expressed."
+                    maxProperties: 32
+                    type: object
+                    x-kubernetes-validations:
+                    - message: objectCounts keys must be a Kubernetes object-count
+                        quota name (services, secrets, configmaps, services.nodeports,
+                        services.loadbalancers, replicationcontrollers, resourcequotas)
+                        or of the form count/<resource>.<group>
+                      rule: self.all(k, k.matches('^(pods|services|services[.]nodeports|services[.]loadbalancers|secrets|configmaps|persistentvolumeclaims|replicationcontrollers|resourcequotas|count/[a-z0-9][a-z0-9-]*([.][a-z0-9][a-z0-9-]*)*)$'))
+                    - message: use spec.quota.pods and spec.quota.storage.persistentVolumeClaims
+                        rather than objectCounts, so each limit has one canonical
+                        place
+                      rule: '!self.exists(k, k == ''pods'' || k == ''persistentvolumeclaims'')'
+                    - message: objectCounts values must not be negative
+                      rule: self.all(k, self[k] >= 0)
+                  pods:
+                    description: |-
+                      pods caps the number of non-terminal pods in the namespace. Renders the
+                      ResourceQuota hard limit "pods".
+
+                      Modelled as an integer rather than a resource.Quantity because a pod
+                      count of "50m" is meaningless; the integer form is validated by the API
+                      server where a quantity string would not be.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  requests:
+                    description: |-
+                      requests caps the sum of container resource *requests* across the
+                      namespace. Renders the ResourceQuota hard limits "requests.cpu" and
+                      "requests.memory".
+
+                      This is the field that governs how much cluster capacity the namespace
+                      can reserve, because the scheduler places pods by their requests.
+                    minProperties: 1
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: cpu is a CPU quantity, for example "8" or "500m".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ephemeralStorage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          ephemeralStorage is a local ephemeral storage quantity, for example
+                          "20Gi".
+
+                          This is node disk: container writable layers, emptyDir volumes, and
+                          container logs. It is worth constraining even when it feels obscure,
+                          because it is the one compute resource whose exhaustion harms other
+                          namespaces. A pod writing without limit to an emptyDir can fill its
+                          node's disk, at which point the kubelet starts evicting pods on that
+                          node — including pods belonging to namespaces that did nothing wrong.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: memory is a memory quantity, for example "16Gi"
+                          or "512Mi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cpu must be greater than zero
+                      rule: '!has(self.cpu) || quantity(string(self.cpu)).isGreaterThan(quantity(''0''))'
+                    - message: memory must be greater than zero
+                      rule: '!has(self.memory) || quantity(string(self.memory)).isGreaterThan(quantity(''0''))'
+                    - message: ephemeralStorage must be greater than zero
+                      rule: '!has(self.ephemeralStorage) || quantity(string(self.ephemeralStorage)).isGreaterThan(quantity(''0''))'
+                  storage:
+                    description: storage caps persistent storage consumption, optionally
+                      per StorageClass.
+                    minProperties: 1
+                    properties:
+                      classes:
+                        description: |-
+                          classes adds per-StorageClass ceilings. Each entry renders the
+                          ResourceQuota hard limits
+                          "<class>.storageclass.storage.k8s.io/requests.storage" and
+                          "<class>.storageclass.storage.k8s.io/persistentvolumeclaims".
+
+                          Entries are keyed by StorageClass name, so a name may appear only once.
+                          The operator does not verify that the StorageClass exists: a quota
+                          naming an absent class is inert rather than an error, which keeps
+                          profiles portable across clusters with different storage offerings.
+                        items:
+                          description: StorageClassQuota is a storage ceiling scoped
+                            to one StorageClass.
+                          properties:
+                            name:
+                              description: name is the StorageClass this entry constrains.
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                              type: string
+                            persistentVolumeClaims:
+                              description: |-
+                                persistentVolumeClaims caps the number of PersistentVolumeClaims using
+                                this StorageClass.
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            requests:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              description: |-
+                                requests caps the sum of PersistentVolumeClaim storage requests for this
+                                StorageClass.
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                          required:
+                          - name
+                          type: object
+                        maxItems: 16
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      persistentVolumeClaims:
+                        description: |-
+                          persistentVolumeClaims caps the number of PersistentVolumeClaims in the
+                          namespace across all StorageClasses. Renders the ResourceQuota hard
+                          limit "persistentvolumeclaims".
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      requests:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          requests caps the sum of PersistentVolumeClaim storage requests across
+                          all StorageClasses. Renders the ResourceQuota hard limit
+                          "requests.storage".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                type: object
+              security:
+                description: |-
+                  security declares the Pod Security Admission level for the namespace,
+                  applied as labels on the namespace itself.
+
+                  Omit to leave Pod Security Admission labels untouched, including labels
+                  a cluster administrator set by hand.
+                properties:
+                  audit:
+                    description: |-
+                      audit is the level to audit, rendering the namespace label
+                      "pod-security.kubernetes.io/audit". Violations are recorded in the API
+                      server audit log and otherwise permitted.
+
+                      Defaults to podSecurityStandard when unset.
+                    enum:
+                    - privileged
+                    - baseline
+                    - restricted
+                    type: string
+                  enforceVersion:
+                    default: latest
+                    description: |-
+                      enforceVersion pins which version of the Pod Security Standards is
+                      applied, rendering the "-version" variants of the labels above.
+
+                      "latest" tracks the API server's current definition, which means a
+                      cluster upgrade can tighten the rules and start rejecting workloads that
+                      previously passed. Pinning to a specific minor ("v1.34") freezes the
+                      definition so upgrades cannot change admission behaviour, at the cost of
+                      having to bump it deliberately.
+                    pattern: ^(latest|v1\.[0-9]{1,3})$
+                    type: string
+                  podSecurityStandard:
+                    description: |-
+                      podSecurityStandard is the level to *enforce*, rendering the namespace
+                      label "pod-security.kubernetes.io/enforce".
+
+                      Pods violating this level are rejected at admission. Already-running
+                      pods are never evicted by a level change, so raising it affects new
+                      pods only.
+                    enum:
+                    - privileged
+                    - baseline
+                    - restricted
+                    type: string
+                  warn:
+                    description: |-
+                      warn is the level to warn on, rendering the namespace label
+                      "pod-security.kubernetes.io/warn". Violations produce a client-visible
+                      warning and are otherwise permitted.
+
+                      Defaults to podSecurityStandard when unset.
+                    enum:
+                    - privileged
+                    - baseline
+                    - restricted
+                    type: string
+                required:
+                - podSecurityStandard
+                type: object
+            required:
+            - namespace
+            type: object
+          status:
+            description: status defines the observed state of NamespaceProfile
+            properties:
+              conditions:
+                description: |-
+                  conditions is the authoritative state of the profile.
+
+                  Condition types:
+                    - "Ready":           every requested resource exists and matches.
+                    - "Progressing":     the operator is actively converging.
+                    - "Degraded":        the operator could not reach the desired state.
+                    - "PolicyCompliant": the live quota, limits, network policies and
+                                         namespace labels match the profile — that is,
+                                         no uncorrected drift.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              conflictingProfiles:
+                description: |-
+                  conflictingProfiles names other NamespaceProfiles that target the same
+                  namespace. Populated on every profile involved, including the one that
+                  owns the namespace, so the conflict is visible from either side.
+                items:
+                  type: string
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: set
+              lastDriftCorrectionTime:
+                description: |-
+                  lastDriftCorrectionTime is when the operator last had to rewrite a
+                  managed resource that had been changed outside the profile. A recent
+                  value here alongside a healthy Ready condition is the signature of
+                  something repeatedly fighting the operator.
+                format: date-time
+                type: string
+              lastSuccessfulReconcileTime:
+                description: |-
+                  lastSuccessfulReconcileTime is when the operator last completed a
+                  reconciliation with no errors.
+
+                  It is not refreshed on every successful pass. Doing so would write status
+                  on every reconciliation, including the overwhelming majority that find
+                  nothing to do, turning a quiet cluster into a steady stream of writes and
+                  watch events.
+                format: date-time
+                type: string
+              managedResources:
+                description: |-
+                  managedResources reports each resource the operator is responsible for
+                  and whether it currently matches the profile.
+                items:
+                  description: |-
+                    ManagedResourceStatus reports one resource the operator is responsible for.
+                    Namespace is omitted because every namespaced managed resource lives in
+                    spec.namespace by construction.
+                  properties:
+                    kind:
+                      description: kind is the resource kind, for example "ResourceQuota".
+                      maxLength: 63
+                      type: string
+                    message:
+                      description: message explains a non-InSync state in one short
+                        sentence.
+                      maxLength: 512
+                      type: string
+                    name:
+                      description: |-
+                        name is the resource name. The operator uses deterministic names, so
+                        this is predictable from the kind.
+                      maxLength: 253
+                      type: string
+                    state:
+                      description: state is the operator's assessment of this resource.
+                      enum:
+                      - InSync
+                      - Drifted
+                      - Missing
+                      - Conflict
+                      - NotManaged
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - state
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  observedGeneration is the metadata.generation this status was computed
+                  from. When it trails metadata.generation, the reported state predates the
+                  most recent spec change.
+                format: int64
+                type: integer
+              phase:
+                description: phase is a one-word summary for display. See conditions
+                  for detail.
+                enum:
+                - Pending
+                - Provisioning
+                - Ready
+                - Degraded
+                - Conflict
+                - Terminating
+                type: string
+              targetNamespace:
+                description: |-
+                  targetNamespace echoes spec.namespace, so the namespace a profile governs
+                  is visible in status and in `kubectl get` output without resolving the
+                  spec.
+                maxLength: 63
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-controller-manager
+  namespace: namespace-bootstrap-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-leader-election-role
+  namespace: namespace-bootstrap-operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-bootstrap-operator-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - limitranges
+  - namespaces
+  - resourcequotas
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-bootstrap-operator-metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-bootstrap-operator-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-namespaceprofile-admin-role
+rules:
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles
+  verbs:
+  - '*'
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-namespaceprofile-editor-role
+rules:
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-namespaceprofile-viewer-role
+rules:
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - platform.nabeem.com
+  resources:
+  - namespaceprofiles/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-leader-election-rolebinding
+  namespace: namespace-bootstrap-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: namespace-bootstrap-operator-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: namespace-bootstrap-operator-controller-manager
+  namespace: namespace-bootstrap-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+  name: namespace-bootstrap-operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: namespace-bootstrap-operator-manager-role
+subjects:
+- kind: ServiceAccount
+  name: namespace-bootstrap-operator-controller-manager
+  namespace: namespace-bootstrap-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: namespace-bootstrap-operator-metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: namespace-bootstrap-operator-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: namespace-bootstrap-operator-controller-manager
+  namespace: namespace-bootstrap-operator-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+    control-plane: controller-manager
+  name: namespace-bootstrap-operator-controller-manager-metrics-service
+  namespace: namespace-bootstrap-operator-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    app.kubernetes.io/name: namespace-bootstrap-operator
+    control-plane: controller-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: namespace-bootstrap-operator
+    control-plane: controller-manager
+  name: namespace-bootstrap-operator-controller-manager
+  namespace: namespace-bootstrap-operator-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: namespace-bootstrap-operator
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: namespace-bootstrap-operator
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        image: docker.io/nabeemdev/namespace-bootstrap-operator:latest
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        ports:
+        - containerPort: 8081
+          name: health
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts: []
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: namespace-bootstrap-operator-controller-manager
+      terminationGracePeriodSeconds: 10
+      volumes: []

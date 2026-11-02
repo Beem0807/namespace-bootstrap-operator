@@ -1,0 +1,67 @@
+# A GPU training namespace, showing extended resources and ephemeral storage.
+#
+# These are the two most expensive things a namespace can consume and the two
+# most commonly left unbounded: accelerators, because they are not built into
+# Kubernetes and so need a vendor-qualified key; and node disk, because nothing
+# makes its absence obvious until a node fills up.
+apiVersion: platform.nabeem.com/v1alpha1
+kind: NamespaceProfile
+metadata:
+  name: ml-training-profile
+spec:
+  namespace: ml-training
+
+  quota:
+    requests:
+      cpu: "64"
+      memory: 256Gi
+      # Training jobs stage datasets to local disk. Without this, one job
+      # writing to an emptyDir can fill its node and get pods evicted there —
+      # including pods from namespaces that did nothing wrong.
+      ephemeralStorage: 500Gi
+    limits:
+      cpu: "128"
+      memory: 512Gi
+      ephemeralStorage: 1Ti
+    pods: 40
+
+    # Device-plugin resources. Keys are vendor-qualified and rendered as
+    # "requests.<key>" in the ResourceQuota.
+    #
+    # Only the requests side is expressible, and that is enough: Kubernetes
+    # requires extended resources to be requested and limited at the same
+    # value, so this is simultaneously a request and a limit ceiling.
+    extendedResources:
+      nvidia.com/gpu: "8"
+      hugepages-2Mi: 2Gi
+
+    objectCounts:
+      count/jobs.batch: 50
+      count/deployments.apps: 5
+      # Training namespaces should not be exposing services to the internet.
+      services.loadbalancers: 0
+
+  limitRange:
+    # A single container may not claim the whole namespace's GPU budget.
+    max:
+      cpu: "32"
+      memory: 128Gi
+      ephemeralStorage: 200Gi
+    defaultRequest:
+      cpu: "2"
+      memory: 8Gi
+      ephemeralStorage: 10Gi
+    default:
+      cpu: "4"
+      memory: 16Gi
+      ephemeralStorage: 50Gi
+
+  security:
+    # GPU workloads frequently need device access that restricted forbids, so
+    # baseline is enforced while restricted is audited to measure the gap.
+    podSecurityStandard: baseline
+    audit: restricted
+    warn: restricted
+
+  lifecycle:
+    deleteNamespaceOnRemoval: false

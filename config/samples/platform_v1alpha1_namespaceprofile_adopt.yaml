@@ -1,0 +1,38 @@
+# Adopting a namespace that already exists.
+#
+# With adoptExisting: true the operator stamps its ownership labels onto the
+# existing namespace and onto any object already sitting at one of its
+# deterministic names, and begins managing them.
+#
+# Two consequences worth understanding before applying this:
+#
+#   1. An adopted namespace is annotated "platform.nabeem.com/adopted: true",
+#      which permanently bars the operator from deleting it. The operator did
+#      not create this namespace and cannot know what else depends on it.
+#
+#   2. If a ResourceQuota named "nsprofile-quota" already exists here, adoption
+#      means the operator takes ownership of its fields and will overwrite them
+#      with the values below.
+apiVersion: platform.nabeem.com/v1alpha1
+kind: NamespaceProfile
+metadata:
+  name: legacy-reporting-profile
+spec:
+  namespace: legacy-reporting
+  adoptExisting: true
+  quota:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    pods: 25
+  security:
+    # Audit and warn at restricted while only enforcing baseline: the usual way
+    # to measure what a restricted level would reject before committing to it.
+    podSecurityStandard: baseline
+    audit: restricted
+    warn: restricted
+  lifecycle:
+    deleteNamespaceOnRemoval: false
+    # Leave the generated policy objects in place if this profile is removed,
+    # because another system is expected to take the namespace over.
+    retainManagedResources: true

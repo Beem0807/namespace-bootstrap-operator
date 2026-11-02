@@ -1,0 +1,92 @@
+{{- /*
+Hand-written, like its sibling managed-resources-protected.yaml; `kubebuilder edit
+--plugins helm/v2-alpha` preserves template files it did not generate.
+
+A SECOND policy rather than another rule in the first one, because the two ask
+different questions. The first asks "is the requester the operator?" and applies to
+whole objects the operator owns outright. This one has to allow everyone to keep
+editing the namespace while forbidding one specific set of label keys - so its rule
+compares oldObject against object, which the first policy could not do: its rules
+also cover DELETE, where there is no new object to compare against.
+*/}}
+{{- if (.Values.admissionPolicy).enabled }}
+{{- $operatorServiceAccount := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "namespace-bootstrap-operator.serviceAccountName" .) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "namespace-labels-protected" "context" $) }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "namespace-bootstrap-operator.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      # UPDATE only, and emphatically not DELETE. Deleting a namespace is a
+      # legitimate cluster-admin action, and blocking it could wedge teardown -
+      # including the operator's own gated deletion path.
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: only-operator-managed
+      expression: >-
+        has(oldObject.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'namespace-bootstrap-operator'
+  variables:
+    # Defaulted to an empty map so the rule still evaluates if someone strips every
+    # label at once, rather than erroring on a missing field and - with
+    # failurePolicy: Fail - rejecting the request for the wrong reason.
+    - name: oldLabels
+      expression: "has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+    - name: newLabels
+      expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+    - name: ownedKeys
+      expression: >-
+        ['app.kubernetes.io/managed-by',
+         'platform.nabeem.com/profile',
+         'pod-security.kubernetes.io/enforce',
+         'pod-security.kubernetes.io/enforce-version',
+         'pod-security.kubernetes.io/audit',
+         'pod-security.kubernetes.io/audit-version',
+         'pod-security.kubernetes.io/warn',
+         'pod-security.kubernetes.io/warn-version']
+  validations:
+    # The namespace stays editable by anyone; only these eight keys are frozen. That
+    # is the distinction a label-scoped policy can make and RBAC cannot: a service
+    # mesh's injection label, a cost-allocation tag and `kubectl annotate` all keep
+    # working, while removing the enforcement label does not.
+    - expression: >-
+        request.userInfo.username == {{ $operatorServiceAccount | quote }} ||
+        variables.ownedKeys.all(k,
+          (k in variables.oldLabels) == (k in variables.newLabels) &&
+          (!(k in variables.oldLabels) || variables.oldLabels[k] == variables.newLabels[k]))
+      reason: Forbidden
+      messageExpression: >-
+        'the ownership and Pod Security labels on this namespace are managed by the ' +
+        'Namespace Bootstrap Operator; change the NamespaceProfile that declares them ' +
+        '(platform.nabeem.com/profile=' + variables.oldLabels['platform.nabeem.com/profile'] +
+        ') instead. Every other label on this namespace remains editable.'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "namespace-labels-protected" "context" $) }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "namespace-bootstrap-operator.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  policyName: {{ include "namespace-bootstrap-operator.resourceName" (dict "suffix" "namespace-labels-protected" "context" $) }}
+  validationActions: [Deny]
+  matchResources:
+    # Namespaces are cluster-scoped, so a namespaceSelector here selects by the
+    # namespace's own labels. Left open deliberately: the matchConditions above
+    # already confine this to namespaces the operator manages.
+    {}
+{{- end }}

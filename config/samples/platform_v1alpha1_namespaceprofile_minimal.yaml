@@ -1,0 +1,23 @@
+# The smallest useful profile: a namespace with an aggregate quota and nothing
+# else.
+#
+# Omitted sections are not managed rather than being applied empty. There is no
+# LimitRange, no NetworkPolicy and no Pod Security Admission label here, so any
+# PSA labels an administrator set on this namespace by hand are left alone.
+apiVersion: platform.nabeem.com/v1alpha1
+kind: NamespaceProfile
+metadata:
+  name: sandbox-profile
+spec:
+  namespace: sandbox
+  quota:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    pods: 10
+  # Paired with the quota above so pods that declare no requests are still
+  # admissible.
+  limitRange:
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
