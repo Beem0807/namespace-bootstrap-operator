@@ -102,7 +102,14 @@ jobs:
           if [ -n "$BASE" ]; then CHANGED=$(git diff --name-only "$BASE" HEAD); else CHANGED=$(git ls-files); fi
           echo "changed files:"; echo "$CHANGED"
           code=false; chart=false
-          echo "$CHANGED" | grep -qE '^(api/|cmd/|internal/|Dockerfile$|go\.(mod|sum)$)' && code=true
+          # _test.go files are compiled only by `go test` and never reach the image, so a
+          # test-only change cannot alter what is published: it must not demand a version
+          # bump or cut a release. They are still *run* - the `test` job is ungated - so a
+          # broken test fails the PR either way. Everything under test/ is already outside
+          # these paths; this also excludes the _test.go files that sit next to the code.
+          echo "$CHANGED" \
+            | grep -E '^(api/|cmd/|internal/|Dockerfile$|go\.(mod|sum)$)' \
+            | grep -qvE '_test\.go$' && code=true
           echo "$CHANGED" | grep -qE '^dist/chart/'                                      && chart=true
           echo "code=$code"   >> "$GITHUB_OUTPUT"
           echo "chart=$chart" >> "$GITHUB_OUTPUT"
