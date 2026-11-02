@@ -3,6 +3,13 @@
 IMAGE_REPO ?= docker.io/nabeemdev/namespace-bootstrap-operator
 IMAGE_TAG ?= latest
 IMG ?= $(IMAGE_REPO):$(IMAGE_TAG)
+
+# Build stamps, linked into the binary so a running operator can say what it is.
+# Parsed from the same file the release pipeline reads, so a local image and a
+# published one report their version the same way.
+VERSION ?= $(shell grep -oE 'Version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' internal/version/version.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+VCS_REF ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -153,7 +160,11 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # make docker-build IMG=<img> BASE_IMAGE=docker.io/library/golang:1.26
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
+	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg VCS_REF=$(VCS_REF) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
+		-t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

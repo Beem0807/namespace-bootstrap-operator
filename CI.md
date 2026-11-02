@@ -204,6 +204,7 @@ Run `make test lint helm-verify` first; it is the same gate CI applies.
 | `hack/verify-chart.sh`                    | chart-drift checks, shared by `make helm-verify` and CI |
 | `.github/actions/trivy-scan/`             | the shared Trivy scan: report + gate                    |
 | `internal/version/version.go`             | the operator version, single source of truth            |
-| `internal/version/version_test.go`        | asserts the chart's `appVersion` matches it             |
+| `internal/version/version_test.go`        | asserts the chart's `appVersion` matches it, and that the workflow's regex can still parse it |
+| `Dockerfile`                              | cross-compiles via `--platform=$BUILDPLATFORM`; stamps version/commit/date via `-ldflags` |
 | `dist/chart/Chart.yaml`                   | chart version and `appVersion`                          |
 | `Makefile`                                | every target CI invokes                                 |

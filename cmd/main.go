@@ -36,6 +36,8 @@ import (
 
 	platformv1alpha1 "github.com/Beem0807/namespace-bootstrap-operator/api/v1alpha1"
 	"github.com/Beem0807/namespace-bootstrap-operator/internal/controller"
+	"github.com/Beem0807/namespace-bootstrap-operator/internal/metrics"
+	"github.com/Beem0807/namespace-bootstrap-operator/internal/version"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -81,6 +83,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Logged before anything else can fail, so even a crash loop tells you which
+	// build is crashing. A :latest tag cannot answer that; this line can.
+	setupLog.Info("Starting namespace-bootstrap-operator",
+		"version", version.Version,
+		"commit", version.Commit,
+		"buildDate", version.BuildDate,
+		"go", version.GoVersion())
+
+	// The same facts as a metric, so the version is answerable from an existing
+	// Prometheus scrape rather than by reading pod logs during an incident.
+	metrics.RecordBuildInfo(version.Version, version.Commit, version.BuildDate, version.GoVersion())
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will

@@ -69,6 +69,12 @@ grep -q '^admissionPolicy:' dist/chart/values.yaml || \
     fail "dist/chart/values.yaml has lost the hand-maintained 'admissionPolicy' block." \
          "It is dropped by 'make helm-regenerate'. Restore it (see git history) and commit."
 
+# Also hand-maintained: the version label on the Deployment, which is how a cluster
+# reports which build is installed without anyone reading the image tag.
+grep -q 'app.kubernetes.io/version' dist/chart/templates/manager/manager.yaml || \
+    fail "the manager Deployment has lost its app.kubernetes.io/version label." \
+         "It is hand-added and dropped by 'make helm-regenerate'. Restore it and commit."
+
 for t in managed-resources-protected namespace-labels-protected; do
     test -f "dist/chart/templates/admission-policy/$t.yaml" || \
         fail "dist/chart/templates/admission-policy/$t.yaml is missing." \

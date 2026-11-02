@@ -43,6 +43,10 @@ permissions:
   id-token: write # OIDC for keyless cosign + attestations
   attestations: write # SLSA build-provenance
   security-events: write # Trivy SARIF -> code scanning
+  # upload-sarif calls GET /repos/{o}/{r}/actions/runs/{id} to attach the alerts to
+  # this run. Without actions:read that returns "Resource not accessible by
+  # integration" and the upload fails, even though security-events:write is granted.
+  actions: read
 
 env:
   IMAGE: nabeemdev/namespace-bootstrap-operator
@@ -106,7 +110,8 @@ jobs:
       - name: Read versions
         id: ver
         run: |
-          VER=$(grep -oE 'Version = "[0-9]+\.[0-9]+\.[0-9]+"' internal/version/version.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          VER=$(grep -oE 'Version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' internal/version/version.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [ -z "$VER" ]; then echo "::error::could not parse Version from internal/version/version.go"; exit 1; fi
           CHART_VER=$(grep -E '^version:'    dist/chart/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
           APP_VER=$(grep -E '^appVersion:'   dist/chart/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
           echo "version=$VER"      >> "$GITHUB_OUTPUT"

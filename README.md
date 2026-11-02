@@ -1282,9 +1282,31 @@ top of those:
 | `nsprofile_drift_corrections_total{profile,kind}` | counter | **alert on this.** A climbing count means something is repeatedly fighting the operator. It always wins, so nothing breaks — it just never settles. |
 | `nsprofile_conflicts_total{profile,reason}` | counter | a profile is inert and needs a human |
 | `nsprofile_ready{profile}` | gauge | is this namespace governed right now? |
+| `nsprofile_build_info{version,commit,build_date,go_version}` | gauge | which build is running. Always 1 — the labels carry the information. `count by (version) (nsprofile_build_info)` catches a straggler left behind by a partial rollout. |
 
 Series are dropped when a profile is deleted, so an alert on
 `nsprofile_ready == 0` cannot fire forever for a namespace nobody manages.
+
+### Which version is running?
+
+The build identity is stamped into the binary at link time, so it does not depend on the
+image tag — which answers nothing when something is deployed from `:latest`.
+
+```console
+$ kubectl -n <namespace> logs deploy/<release>-controller-manager | head -1
+INFO  setup  Starting namespace-bootstrap-operator
+      {"version": "0.1.0", "commit": "9f3c1ab", "buildDate": "2026-11-02T00:14:03Z", "go": "go1.26.3"}
+```
+
+Or from the metrics endpoint, without reading logs:
+
+```
+nsprofile_build_info{version="0.1.0",commit="9f3c1ab",build_date="...",go_version="go1.26.3"} 1
+```
+
+The Deployment also carries `app.kubernetes.io/version`, so `kubectl get deploy --show-labels`
+answers it too. A binary built with a plain `go build` reports `commit` and `buildDate` as
+`unknown`, which is how a development build identifies itself as one.
 
 ## License
 

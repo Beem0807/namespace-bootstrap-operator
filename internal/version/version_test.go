@@ -70,3 +70,34 @@ func findYAMLScalar(t *testing.T, doc, key string) string {
 	}
 	return matches[1]
 }
+
+// TestPipelineCanParseVersion guards a coupling that is invisible from the Go
+// side: the release workflow does not import this package, it greps this
+// file's source text for the version.
+//
+//	grep -oE 'Version\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"' internal/version/version.go
+//
+// Moving Version into a var block would make gofmt align the "=", and a
+// stricter form of that pattern would then match nothing — the pipeline would
+// read an empty version and tag an image ":" with no version at all. This test
+// applies the same expression the workflow does, so that failure shows up here
+// instead of mid-release.
+func TestPipelineCanParseVersion(t *testing.T) {
+	raw, err := os.ReadFile("version.go")
+	if err != nil {
+		t.Fatalf("reading version.go: %v", err)
+	}
+
+	matches := regexp.MustCompile(`Version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"`).FindAllStringSubmatch(string(raw), -1)
+	if len(matches) == 0 {
+		t.Fatal("the release workflow's regex finds no version in version.go; " +
+			"it would tag an image with an empty version")
+	}
+	if len(matches) > 1 {
+		t.Fatalf("the workflow's regex matches %d times in version.go; it takes the first, "+
+			"so an unintended match could change what gets published", len(matches))
+	}
+	if got := matches[0][1]; got != Version {
+		t.Errorf("workflow would parse %q, but Version is %q", got, Version)
+	}
+}

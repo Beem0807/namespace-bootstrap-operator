@@ -89,12 +89,38 @@ var (
 	)
 )
 
+// BuildInfo publishes which build is running, as labels on a gauge that is
+// always 1.
+//
+// This is the standard Prometheus way to expose build identity, and it exists
+// because the image tag is not a reliable answer: anything deployed from
+// :latest, or with the tag overridden, leaves no way to tell what is actually
+// running. Having it as a series means the question is answerable from a
+// scrape that already exists, and that `count by (version) (nsprofile_build_info)`
+// will show a straggler left behind by a partial rollout.
+//
+// The label set is bounded by the number of distinct builds deployed, not by
+// anything a workload can influence.
+var BuildInfo = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "nsprofile_build_info",
+		Help: "Build identity of the running operator. Always 1; the labels carry the information.",
+	},
+	[]string{"version", "commit", "build_date", "go_version"},
+)
+
 func init() {
 	// Registering with controller-runtime's registry rather than Prometheus's
 	// default is what puts these on the manager's existing metrics endpoint,
 	// alongside the built-in controller and Go runtime metrics. No separate
 	// server, port or scrape target is involved.
-	ctrlmetrics.Registry.MustRegister(DriftCorrectionsTotal, ConflictsTotal, Ready)
+	ctrlmetrics.Registry.MustRegister(DriftCorrectionsTotal, ConflictsTotal, Ready, BuildInfo)
+}
+
+// RecordBuildInfo publishes the running build's identity. Called once at
+// startup.
+func RecordBuildInfo(version, commit, buildDate, goVersion string) {
+	BuildInfo.WithLabelValues(version, commit, buildDate, goVersion).Set(1)
 }
 
 // RecordDrift notes that a managed resource of the given kind had to be

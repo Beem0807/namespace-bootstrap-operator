@@ -7,9 +7,10 @@ metadata:
     app.kubernetes.io/name: {{ include "namespace-bootstrap-operator.name" . }}
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     control-plane: controller-manager
     {{- with .Values.manager.labels }}
-    {{- with omit . "app.kubernetes.io/managed-by" "app.kubernetes.io/name" "helm.sh/chart" "app.kubernetes.io/instance" "control-plane" }}
+    {{- with omit . "app.kubernetes.io/managed-by" "app.kubernetes.io/name" "helm.sh/chart" "app.kubernetes.io/instance" "app.kubernetes.io/version" "control-plane" }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
     {{- end }}
