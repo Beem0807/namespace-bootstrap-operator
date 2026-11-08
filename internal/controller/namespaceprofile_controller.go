@@ -185,7 +185,22 @@ func (r *NamespaceProfileReconciler) Reconcile(ctx context.Context, req ctrl.Req
 func (r *NamespaceProfileReconciler) provision(
 	ctx context.Context, profile *platformv1alpha1.NamespaceProfile, owners ownership,
 ) (observation, ctrl.Result, error) {
-	obs := observation{competitors: owners.competitors}
+	obs := observation{}
+
+	// Competitors are recorded only on a profile that lost. A profile that owns
+	// the namespace is healthy, and "conflictingProfiles" on a Ready object reads
+	// as a problem where there is none — nothing conflicts from the winner's point
+	// of view. The losing profile names the owner, which is the half somebody has
+	// to act on, and the conflict is independently visible through the Warning
+	// event and nsprofile_conflicts_total.
+	//
+	// This also makes the field deterministic. Recording it on the winner too
+	// would mean populating it only when the winner happens to reconcile while a
+	// rival exists: nothing wakes an established profile when a newcomer stands
+	// down, because standing down touches nothing and so emits no event.
+	if owners.owner != profile.Name {
+		obs.competitors = owners.competitors
+	}
 
 	// Another profile is entitled to this namespace. Stop before touching
 	// anything: two profiles writing the same namespace would each undo the
@@ -539,8 +554,15 @@ func (r *NamespaceProfileReconciler) ensureNamespace(
 	}
 
 	if reclaiming {
+		// namespace is the copy read before the apply, so this still names the
+		// profile that held it rather than the one taking over.
+		previous := resources.ManagingProfile(&namespace)
 		log.Info("reclaimed a namespace whose previous profile no longer competes for it",
-			"previousProfile", resources.ManagingProfile(&namespace))
+			"previousProfile", previous)
+		r.event(profile, corev1.EventTypeWarning, platformv1alpha1.ReasonNamespaceReclaimed,
+			platformv1alpha1.ActionProvisioning,
+			"took over namespace %s from profile %s, which no longer exists",
+			profile.Spec.Namespace, previous)
 		return namespaceOutcome{
 			status: report(platformv1alpha1.ManagedResourceInSync, ""),
 			state:  namespaceUsable,

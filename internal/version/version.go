@@ -38,7 +38,7 @@ import (
 // pipeline parses this line out of the source, and gofmt aligns the "=" in a
 // block — which would silently stop the pipeline from finding the version.
 // TestPipelineCanParseVersion guards that coupling.
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 // Commit and BuildDate are stamped in at link time by the release build:
 //

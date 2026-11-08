@@ -76,8 +76,13 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
+	// Production defaults: JSON, INFO, ISO8601 UTC. Development mode is a console
+	// encoder at DEBUG in local time, which is pleasant to read by hand and wrong
+	// for anything shipping logs somewhere. opts.BindFlags still exposes
+	// --zap-devel, --zap-log-level and --zap-encoder, so debugging locally is a
+	// flag rather than a rebuild.
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -146,6 +151,7 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Cache:                  controller.CacheOptions(),
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,

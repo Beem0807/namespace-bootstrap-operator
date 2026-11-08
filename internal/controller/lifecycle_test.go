@@ -47,17 +47,33 @@ import (
 var _ = Describe("Ownership, adoption and deletion", func() {
 	var (
 		reconciler *NamespaceProfileReconciler
+		recorder   *events.FakeRecorder
 		counter    int
 	)
 
 	BeforeEach(func() {
+		recorder = events.NewFakeRecorder(100)
 		reconciler = &NamespaceProfileReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: events.NewFakeRecorder(100),
+			Recorder: recorder,
 		}
 		counter++
 	})
+
+	// drainEvents empties the recorder, returning everything published since
+	// the last call.
+	drainEvents := func() []string {
+		var published []string
+		for {
+			select {
+			case event := <-recorder.Events:
+				published = append(published, event)
+			default:
+				return published
+			}
+		}
+	}
 
 	unique := func(prefix string) string {
 		return fmt.Sprintf("%s-%d", prefix, counter)
@@ -525,9 +541,15 @@ var _ = Describe("Ownership, adoption and deletion", func() {
 			Expect(winner.Status.Phase).To(Equal(platformv1alpha1.ProfilePhaseReady))
 			Expect(loser.Status.Phase).To(Equal(platformv1alpha1.ProfilePhaseConflict))
 
-			By("naming the competitor on both sides, so the conflict is visible from either")
-			Expect(winner.Status.ConflictingProfiles).To(ConsistOf("zzz-conflict-profile"))
+			By("naming the owner on the blocked profile, and leaving the winner quiet")
+			// Only the loser reports. The winner is healthy, and a populated
+			// "conflictingProfiles" on a Ready profile reads as a problem where
+			// there is none. It is also the only version of this that is
+			// deterministic: nothing wakes an established profile when a rival
+			// appears and stands down, so recording it on the winner would depend
+			// on reconcile timing.
 			Expect(loser.Status.ConflictingProfiles).To(ConsistOf("aaa-conflict-profile"))
+			Expect(winner.Status.ConflictingProfiles).To(BeEmpty())
 
 			By("reporting the loser as conflicted but not degraded")
 			ready := meta.FindStatusCondition(loser.Status.Conditions, platformv1alpha1.ConditionReady)
@@ -618,6 +640,16 @@ var _ = Describe("Ownership, adoption and deletion", func() {
 			Expect(getProfile("zzz-successor-profile").Status.Phase).
 				To(Equal(platformv1alpha1.ProfilePhaseReady))
 			Expect(quotaExists(ns)).To(BeTrue())
+
+			By("recording the handover, since nothing else would")
+			// The successor reports Ready, and the profile that used to own the
+			// namespace is gone — so without this event a namespace changing
+			// hands leaves no trace anyone would notice.
+			Expect(drainEvents()).To(ContainElement(SatisfyAll(
+				ContainSubstring("Warning"),
+				ContainSubstring(platformv1alpha1.ReasonNamespaceReclaimed),
+				ContainSubstring("aaa-retiring-profile"),
+			)))
 		})
 
 		It("never lets adoption override another profile's ownership", func() {
