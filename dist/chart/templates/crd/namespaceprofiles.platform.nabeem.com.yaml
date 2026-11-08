@@ -1090,9 +1090,12 @@ spec:
                 x-kubernetes-list-type: map
               conflictingProfiles:
                 description: |-
-                  conflictingProfiles names other NamespaceProfiles that target the same
-                  namespace. Populated on every profile involved, including the one that
-                  owns the namespace, so the conflict is visible from either side.
+                  conflictingProfiles names the other NamespaceProfiles that target the same
+                  namespace, including whichever one owns it.
+
+                  Populated only on a profile that does not own the namespace — that profile
+                  is the one blocked, and this is where to look for who to talk to. A profile
+                  that owns its namespace is working correctly and leaves this empty.
                 items:
                   type: string
                 maxItems: 16

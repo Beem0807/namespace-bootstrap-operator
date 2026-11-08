@@ -57,9 +57,9 @@ type observation struct {
 	blocked       bool
 	blockedReason string
 
-	// competitors are other profiles targeting the same namespace. Recorded on
-	// every profile involved, including the winner, so the conflict is visible
-	// from either side rather than only from the profile that lost.
+	// competitors are the other profiles targeting the same namespace, recorded
+	// only on a profile that lost the arbitration. The winner is healthy and says
+	// nothing; see the note in provision() for why.
 	competitors []string
 }
 

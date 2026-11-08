@@ -205,6 +205,15 @@ const (
 	// target namespace. The operator stays idle rather than fighting it.
 	ReasonNamespaceConflict = "NamespaceConflict"
 
+	// ReasonNamespaceReclaimed means this profile has taken over a namespace
+	// that another NamespaceProfile used to own, because that profile is gone.
+	//
+	// Emitted as a Warning rather than Normal. The handover itself is intended
+	// behaviour — it is what lets a retiring profile be replaced without anyone
+	// intervening — but it is also the one moment a namespace silently changes
+	// hands, and the previous owner no longer exists to report it.
+	ReasonNamespaceReclaimed = "NamespaceReclaimed"
+
 	// ReasonNamespaceNotAdopted means the target namespace already exists
 	// without this operator's ownership labels and spec.adoptExisting is
 	// false.

@@ -106,6 +106,10 @@ var _ = BeforeSuite(func() {
 	By("starting a manager with the real controller")
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme.Scheme,
+		// The same cache narrowing the operator runs with in production. A cache
+		// scoped wrongly does not error, it silently returns NotFound, so these
+		// specs have to exercise the real settings rather than the defaults.
+		Cache: controller.CacheOptions(),
 		// Nothing here scrapes metrics or probes health, and binding real
 		// ports would make the suite fail when run concurrently with anything
 		// else.

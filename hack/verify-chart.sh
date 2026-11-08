@@ -53,15 +53,40 @@ print("keeping the templated header above it, and commit the result.", file=sys.
 sys.exit(1)
 PY
 
-# The chart's CRD is the generated one wrapped in a Helm conditional, so it should
-# track the real schema closely. A large divergence means it is stale.
-chart_crd_lines=$(grep -c '' "$CHART_CRD")
-real_crd_lines=$(grep -c '' "$REAL_CRD")
-delta=$(( chart_crd_lines > real_crd_lines ? chart_crd_lines - real_crd_lines : real_crd_lines - chart_crd_lines ))
-if [ "$delta" -gt 20 ]; then
-    fail "$CHART_CRD ($chart_crd_lines lines) has drifted from $REAL_CRD ($real_crd_lines lines)." \
-         "Run 'make helm-regenerate', restore the hand-maintained values, and commit."
-fi
+# The chart's CRD is the generated one wrapped in a Helm conditional: everything
+# above "spec:" is templated (the resource-policy annotation), everything from
+# "spec:" down must match the generated schema exactly.
+#
+# Compared by content, not by line count. A line-count check with a tolerance
+# happily passes a reworded field description, which is how the chart once
+# shipped a CRD documenting behaviour the operator no longer had.
+python3 - "$CHART_CRD" "$REAL_CRD" <<'CRDPY' || exit 1
+import sys, difflib
+
+def spec(path):
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("spec:"):
+            # the chart closes with the Helm conditional; the generated file does not
+            return [l for l in lines[i:] if l.strip() not in ("", "{{- end }}")]
+    sys.exit(f"Error: {path} has no top-level 'spec:'.")
+
+chart_path, real_path = sys.argv[1], sys.argv[2]
+chart, real = spec(chart_path), spec(real_path)
+if chart == real:
+    sys.exit(0)
+
+print(f"Error: {chart_path} has drifted from {real_path}.", file=sys.stderr)
+for line in list(difflib.unified_diff(real, chart, fromfile=real_path,
+                                      tofile=chart_path, lineterm=""))[:40]:
+    print("  " + line, file=sys.stderr)
+print("", file=sys.stderr)
+print("Copy everything from 'spec:' down out of the generated CRD into the chart",
+      file=sys.stderr)
+print("template, keeping its templated header and trailing {{- end }}.", file=sys.stderr)
+sys.exit(1)
+CRDPY
 
 # The admission-policy templates survive `kubebuilder edit` but values.yaml does
 # not, so the flag can silently disappear on a chart regeneration.

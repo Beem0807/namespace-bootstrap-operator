@@ -13,6 +13,15 @@ manager:
   ##
   enabled: true
 
+  ## One replica is the intended default. The operator is a single-writer
+  ## controller and --leader-elect is set, so raising this gives you a warm
+  ## standby rather than more throughput.
+  ##
+  ## There is deliberately no PodDisruptionBudget: a node drain pauses drift
+  ## *correction*, not enforcement. Quotas, limit ranges, network policies and
+  ## Pod Security labels are enforced by the API server and the CNI, and go on
+  ## being enforced while the operator is down.
+  ##
   replicas: 1
 
   image:
@@ -55,15 +64,26 @@ manager:
       - ALL
     readOnlyRootFilesystem: true
 
-  ## Resource limits and requests
+  ## Resource limits and requests.
+  ##
+  ## Memory scales with the size of the cluster, not with how many profiles you
+  ## have. The operator watches Namespace and NetworkPolicy cluster-wide, so its
+  ## cache holds every one of those objects. (ResourceQuota and LimitRange are
+  ## narrowed to the operator's own two names, and managedFields are stripped from
+  ## everything cached — see internal/controller/cache.go.)
+  ##
+  ## 256Mi is comfortable into the low thousands of namespaces. If the pod is
+  ## OOM-killed, raise this first: the symptom is a CrashLoopBackOff that starts
+  ## only once the cluster grows, and drift correction stops cluster-wide while it
+  ## is down.
   ##
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 256Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 128Mi
 
   ## Manager pod's affinity
   ##

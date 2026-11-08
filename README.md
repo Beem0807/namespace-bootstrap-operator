@@ -204,6 +204,22 @@ gets a validated, documented API and *cannot express an invalid namespace* — w
 write access to a NamespaceProfile stays cluster-admin-adjacent for the reasons in
 [Who may create or update a NamespaceProfile](#who-may-create-or-update-a-namespaceprofile).
 
+### It does not care how the profile arrives
+
+A `NamespaceProfile` is an ordinary Kubernetes object, so anything that can talk to the
+API server can create one — ArgoCD, Flux, `kubectl apply`, Terraform, a Helm chart, a
+script, a controller of your own. The operator watches the API server, not a Git
+repository, and has no opinion about where the object came from.
+
+That is worth stating because it is the opposite of the usual trade-off. Adopting this
+does not commit you to a delivery tool, and moving between tools later does not touch
+the operator or the profiles. The same profile applies identically on a managed cloud
+cluster, a kind cluster in CI, or a bare-metal cluster with no GitOps at all.
+
+It also means the enforcement half survives the delivery half being down. If ArgoCD is
+unavailable, or the Git host is, already-applied profiles keep being reconciled and
+drift keeps being corrected — because nothing in the loop reads Git.
+
 ### Using it with ArgoCD
 
 These compose, and the combination is better than either alone. Let ArgoCD own the
@@ -462,7 +478,7 @@ worth knowing about:
 | `manager.image.tag` | *(unset)* | **falls back to `Chart.appVersion`**, so the chart and image versions cannot silently diverge |
 | `manager.image.pullPolicy` | `IfNotPresent` | set `Never` for a locally side-loaded image |
 | `manager.replicas` | `1` | safe to raise: leader election means only one replica reconciles |
-| `manager.resources` | `500m`/`128Mi` limits, `10m`/`64Mi` requests | the operator is cheap; it watches four low-cardinality kinds and no pods |
+| `manager.resources` | `500m`/`256Mi` limits, `10m`/`128Mi` requests | memory scales with **cluster size**, not profile count — see below |
 | `manager.args` | `[--leader-elect]` | manager flags |
 | `manager.healthProbe.port` | `8081` | `/healthz` and `/readyz` |
 | `manager.affinity`, `nodeSelector`, `tolerations` | empty | standard scheduling controls |
@@ -477,6 +493,27 @@ worth knowing about:
 | `metrics.secure` | `true` | require authentication and authorization to scrape |
 | `prometheus.enabled` | `false` | install a `ServiceMonitor` (needs the Prometheus Operator) |
 | `networkPolicy.enabled` | `false` | see the warning below |
+
+#### Sizing memory
+
+The manager's client is cache-backed: reading one object of a kind makes an
+informer LIST and WATCH that kind cluster-wide. So the operator's memory tracks
+**how big the cluster is**, not how many profiles you have.
+
+Two things keep that bounded. `managedFields` is stripped from everything cached —
+nothing here reads it, and server-side apply makes it large. And the `ResourceQuota`
+and `LimitRange` caches are narrowed to the operator's own two deterministic names,
+since those are the only ones it ever reads.
+
+`Namespace` and `NetworkPolicy` are deliberately **not** narrowed: cleanup lists
+policies by label to catch ones left under names an older version generated, and
+conflict detection has to see foreign objects occupying the operator's names.
+Either scoping would silently break one of those. See
+[`internal/controller/cache.go`](internal/controller/cache.go).
+
+`256Mi` is comfortable into the low thousands of namespaces. If the pod is
+OOM-killed, raise it first — the symptom is a `CrashLoopBackOff` that only appears
+once the cluster grows, and drift correction stops cluster-wide while it is down.
 
 ```bash
 helm install nbo namespace-bootstrap-operator/namespace-bootstrap-operator \
@@ -749,9 +786,17 @@ Ownership is decided in a fixed order:
    forever while both reported success.
 
 Profiles being deleted are excluded, which lets a namespace pass from a retiring
-profile to its replacement with no intervention. The loser reports
-`Ready=False, Reason=NamespaceConflict` and touches nothing; both sides list each
-other in `status.conflictingProfiles`.
+profile to its replacement with no intervention. The handover is recorded as a
+Warning event on the successor (`NamespaceReclaimed`) — it is intended behaviour,
+but it is also the one moment a namespace changes hands, and the profile that used
+to own it no longer exists to report anything.
+
+The loser reports `Ready=False, Reason=NamespaceConflict`, names the owner in
+`status.conflictingProfiles`, and touches nothing. The winner stays quiet: it is
+healthy, and a populated `conflictingProfiles` on a `Ready` profile reads as a
+problem where there is none. It is also the only version of this that is
+deterministic — nothing wakes an established profile when a newcomer appears and
+stands down, because standing down emits no event.
 
 ### Adoption
 
@@ -1251,6 +1296,7 @@ than no spec at all. Verifying enforcement requires installing Calico or Cilium.
 api/v1alpha1/            NamespaceProfile types, CEL rules, label/annotation contract
 internal/resources/      pure builders — spec in, desired objects out, no I/O
 internal/controller/     Reconcile, status, lifecycle (conflicts, finalizer, deletion)
+internal/controller/cache.go   what the manager keeps in memory, shared with the tests
 internal/metrics/        domain metrics
 internal/version/        the released version, and the guard that the chart matches it
 cmd/main.go              manager wiring
@@ -1266,8 +1312,10 @@ CI.md                    how this repo is tested, built, signed and published
 fall behind the markers — a mistake this repo made once. Two parts of the chart are
 hand-maintained and *do not* survive a regeneration: the admission-policy templates
 and the `admissionPolicy` block in `values.yaml`. `make helm-verify` checks all of
-it — the RBAC rules rule by rule, so a changed verb fails and not merely a missing
-resource — and CI runs the same script.
+it: the RBAC rules rule by rule, so a changed verb fails and not merely a missing
+resource, and the CRD by content rather than by line count — a tolerance let a
+reworded field description through once, and the chart shipped a schema describing
+behaviour the operator no longer had. CI runs the same script.
 
 See [CI.md](CI.md) for the release pipeline, the version-bump rules and the
 one-time setup it expects.
